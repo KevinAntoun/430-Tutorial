@@ -1,0 +1,4 @@
+/* subtle polish */
+.table td, .table th { vertical-align: middle; }
+.card { border-radius: 0.6rem; }
+.navbar-brand { letter-spacing: .2px; }

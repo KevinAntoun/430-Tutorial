@@ -1,0 +1,28 @@
+{% extends 'vid/base.html' %}
+{% block title %}{{ video.title }} · Video Store{% endblock %}
+{% block content %}
+  <div class="d-flex align-items-center justify-content-between mb-3">
+    <h1 class="h4 m-0">{{ video.title }} <span class="text-muted">({{ video.release_year }})</span></h1>
+    <div class="d-flex gap-2">
+      <a class="btn btn-primary" href="{% url 'vid:video_update' video.pk %}">Edit</a>
+      <a class="btn btn-outline-danger" href="{% url 'vid:video_delete' video.pk %}">Delete</a>
+    </div>
+  </div>
+
+  <div class="card shadow-sm">
+    <div class="card-body">
+      <dl class="row mb-0">
+        <dt class="col-sm-3">MovieID</dt><dd class="col-sm-9">{{ video.movie_id }}</dd>
+        <dt class="col-sm-3">Actor1Name</dt><dd class="col-sm-9">{{ video.actor1 }}</dd>
+        <dt class="col-sm-3">Actor2Name</dt><dd class="col-sm-9">{{ video.actor2|default:"—" }}</dd>
+        <dt class="col-sm-3">DirectorName</dt><dd class="col-sm-9">{{ video.director }}</dd>
+        <dt class="col-sm-3">MovieGenre</dt><dd class="col-sm-9"><span class="badge text-bg-secondary">{{ video.genre }}</span></dd>
+        <dt class="col-sm-3">ReleaseYear</dt><dd class="col-sm-9">{{ video.release_year }}</dd>
+      </dl>
+    </div>
+  </div>
+
+  <div class="mt-3">
+    <a class="btn btn-secondary" href="{% url 'vid:video_list' %}">Back to list</a>
+  </div>
+{% endblock %}

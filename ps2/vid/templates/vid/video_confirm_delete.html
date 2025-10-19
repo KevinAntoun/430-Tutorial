@@ -1,0 +1,15 @@
+{% extends 'vid/base.html' %}
+{% block title %}Delete Video · Video Store{% endblock %}
+{% block content %}
+  <div class="card border-danger shadow-sm">
+    <div class="card-body">
+      <h1 class="h5 text-danger">Delete Video</h1>
+      <p>Are you sure you want to delete <strong>{{ video.title }}</strong> (MovieID: {{ video.movie_id }})?</p>
+      <form method="post" class="d-inline">
+        {% csrf_token %}
+        <button class="btn btn-danger" type="submit">Yes, delete</button>
+      </form>
+      <a class="btn btn-secondary ms-2" href="{% url 'vid:video_detail' video.pk %}">No, go back</a>
+    </div>
+  </div>
+{% endblock %}
