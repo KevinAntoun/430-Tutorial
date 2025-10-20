@@ -1,0 +1,47 @@
+pipeline {
+  agent any
+
+  environment {
+    IMAGE      = 'my-django-app:latest'
+    CONTAINER  = 'my-django-app'
+    PORTS      = '8000:8000'
+    GIT_URL    = 'https://github.com/KevinAntoun/430-Tutorial'
+    GIT_BRANCH = 'main'
+  }
+
+  stages {
+    stage('Checkout') {
+      steps {
+        cleanWs()
+        git branch: env.GIT_BRANCH, url: env.GIT_URL
+      }
+    }
+
+    stage('Build Docker Image') {
+      steps {
+        dir('ps2') {
+      sh 'docker build -t my-django-app:latest .'
+    }
+      }
+    }
+
+    stage('Stop Old Container') {
+      steps {
+        sh '''
+          echo "Stopping and removing old container (if any)..."
+          docker rm -f "$CONTAINER" 2>/dev/null || true
+        '''
+      }
+    }
+
+    stage('Run New Container') {
+      steps {
+        sh '''
+          echo "Running new container..."
+          docker run -d --name "$CONTAINER" -p ${PORTS} "$IMAGE"
+          docker ps
+        '''
+      }
+    }
+  }
+}
