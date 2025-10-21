@@ -142,7 +142,7 @@ pipeline {
       echo "Collecting Minikube & network logs for debugging…"
       sh 'minikube -p minikube logs --file=logs.txt || true'
       archiveArtifacts artifacts: 'logs.txt', onlyIfSuccessful: false, allowEmptyArchive: true
-      # Keep a general network listing for context; no custom network inspect anymore.
+      // Keep a general network listing for context; no custom network inspect anymore.
       sh 'docker network ls || true'
     }
   }
