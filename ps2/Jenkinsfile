@@ -2,15 +2,16 @@ pipeline {
   agent any
 
   triggers {
-    // Poll GitHub every 2 minutes
-    pollSCM('H/2 * * * *')
+    pollSCM('H/2 * * * *') // every 2 minutes
   }
 
   environment {
-    NS     = 'default'
-    APP    = 'mydjangoapp'
-    DEPLOY = 'django-deployment'   // must match metadata.name in deployment.yaml
-    CTR    = 'web'                 // must match containers[].name in deployment.yaml
+    NS          = 'default'
+    APP         = 'mydjangoapp'
+    DEPLOY      = 'django-deployment' // metadata.name in deployment.yaml
+    CTR         = 'web'               // containers[].name in deployment.yaml
+    DOCKER_CTX  = 'ps2'               // where your Dockerfile is
+    MANIFEST_DIR= 'ps2'               // where deployment.yaml/service.yaml are (use '.' if at repo root)
   }
 
   stages {
@@ -21,11 +22,24 @@ pipeline {
       }
     }
 
+    stage('Install minikube CLI (once per container)') {
+      steps {
+        sh '''
+          set -e
+          if ! command -v minikube >/dev/null 2>&1; then
+            curl -fsSL https://storage.googleapis.com/minikube/releases/latest/minikube-linux-amd64 -o /usr/local/bin/minikube
+            chmod +x /usr/local/bin/minikube
+          fi
+          minikube version || true
+        '''
+      }
+    }
+
     stage('Compute Tag') {
       steps {
         script {
           env.TAG   = sh(returnStdout: true, script: 'git rev-parse --short HEAD').trim()
-          env.IMAGE = "${env.APP}:${env.TAG}"   // local tag; we will load into Minikube
+          env.IMAGE = "${env.APP}:${env.TAG}"   // local tag; we load into Minikube
           echo "IMAGE=${env.IMAGE}"
         }
       }
@@ -33,8 +47,7 @@ pipeline {
 
     stage('Build Docker Image (local)') {
       steps {
-        // adjust path if your Dockerfile is in ps2/
-        dir('ps2') {
+        dir(env.DOCKER_CTX) {
           sh "docker build -t ${IMAGE} ."
         }
       }
@@ -42,23 +55,17 @@ pipeline {
 
     stage('Load Image into Minikube') {
       steps {
-        // uses the minikube on the host; kubectl inside container already works
         sh "minikube image load ${IMAGE}"
       }
     }
 
     stage('Apply Manifests & Rollout') {
       steps {
-        // adjust paths if yamls are in ps2/
         sh """
-          kubectl -n ${NS} apply -f deployment.yaml
-          kubectl -n ${NS} apply -f service.yaml
-
-          # set the image on the Deployment and wait for rollout
+          kubectl -n ${NS} apply -f ${MANIFEST_DIR}/deployment.yaml
+          kubectl -n ${NS} apply -f ${MANIFEST_DIR}/service.yaml
           kubectl -n ${NS} set image deploy/${DEPLOY} ${CTR}=${IMAGE}
           kubectl -n ${NS} rollout status deploy/${DEPLOY} --timeout=180s
-
-          echo '--- Post-deploy ---'
           kubectl -n ${NS} get deploy ${DEPLOY} -o wide
           kubectl -n ${NS} get pods -n ${NS} -o wide
         """
