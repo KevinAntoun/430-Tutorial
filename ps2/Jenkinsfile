@@ -1,34 +1,68 @@
 pipeline {
-agent any
-triggers {
-// Poll GitHub every 2 minutes
-pollSCM('H/2 * * * *')
-}
-stages {
-stage('Checkout') {
-steps {
-git branch: 'main', url: 'https://github.com/KevinAntoun/430-Tutorial'
-}
-stage('Build in Minikube Docker') {
-steps {
-bat '''
-REM === Switch Docker to Minikube Docker ===
-call minikube docker-env --shell=cmd > docker_env.bat
-call docker_env.bat
-REM === Build Django image inside Minikube Docker ===
-docker build -t mydjangoapp:latest .
-'''
-}
-}
-stage('Deploy to Minikube') {
-steps {
-bat '''
-REM === Apply the updated deployment manifest ===
-kubectl apply -f deployment.yaml
-REM === Ensure the rollout completes ===
-kubectl rollout status deployment/django-deployment
-'''
-}
-}
-}
+  agent any
+
+  triggers {
+    // Poll GitHub every 2 minutes
+    pollSCM('H/2 * * * *')
+  }
+
+  environment {
+    NS     = 'default'
+    APP    = 'mydjangoapp'
+    DEPLOY = 'django-deployment'   // must match metadata.name in deployment.yaml
+    CTR    = 'web'                 // must match containers[].name in deployment.yaml
+  }
+
+  stages {
+    stage('Checkout') {
+      steps {
+        cleanWs()
+        git branch: 'main', url: 'https://github.com/KevinAntoun/430-Tutorial'
+      }
+    }
+
+    stage('Compute Tag') {
+      steps {
+        script {
+          env.TAG   = sh(returnStdout: true, script: 'git rev-parse --short HEAD').trim()
+          env.IMAGE = "${env.APP}:${env.TAG}"   // local tag; we will load into Minikube
+          echo "IMAGE=${env.IMAGE}"
+        }
+      }
+    }
+
+    stage('Build Docker Image (local)') {
+      steps {
+        // adjust path if your Dockerfile is in ps2/
+        dir('ps2') {
+          sh "docker build -t ${IMAGE} ."
+        }
+      }
+    }
+
+    stage('Load Image into Minikube') {
+      steps {
+        // uses the minikube on the host; kubectl inside container already works
+        sh "minikube image load ${IMAGE}"
+      }
+    }
+
+    stage('Apply Manifests & Rollout') {
+      steps {
+        // adjust paths if yamls are in ps2/
+        sh """
+          kubectl -n ${NS} apply -f deployment.yaml
+          kubectl -n ${NS} apply -f service.yaml
+
+          # set the image on the Deployment and wait for rollout
+          kubectl -n ${NS} set image deploy/${DEPLOY} ${CTR}=${IMAGE}
+          kubectl -n ${NS} rollout status deploy/${DEPLOY} --timeout=180s
+
+          echo '--- Post-deploy ---'
+          kubectl -n ${NS} get deploy ${DEPLOY} -o wide
+          kubectl -n ${NS} get pods -n ${NS} -o wide
+        """
+      }
+    }
+  }
 }
