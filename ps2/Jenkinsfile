@@ -2,20 +2,27 @@ pipeline {
   agent any
 
   triggers {
-    pollSCM('H/2 * * * *') // every 2 minutes
+    // poll every 2 minutes
+    pollSCM('H/2 * * * *')
   }
 
   environment {
-    NS           = 'default'
-    APP          = 'mydjangoapp'
-    DEPLOY       = 'django-deployment'
-    CTR          = 'web'
-    DOCKER_CTX   = 'ps2'
-    MANIFEST_DIR = 'ps2'
+    NS            = 'default'
+    APP           = 'mydjangoapp'
+    DEPLOY        = 'django-deployment'   // metadata.name in deployment.yaml
+    CTR           = 'web'                 // containers[].name in deployment.yaml
+    DOCKER_CTX    = 'ps2'                 // path containing Dockerfile
+    MANIFEST_DIR  = 'ps2'                 // path containing deployment.yaml/service.yaml
 
-    // Make minikube + kubeconfig live in the workspace (persist across steps)
+    // Persist cluster config/state across stages in this workspace
     MINIKUBE_HOME = "${WORKSPACE}/.minikube"
     KUBECONFIG    = "${WORKSPACE}/.kube/config"
+  }
+
+  options {
+    // show full command logs
+    ansiColor('xterm')
+    timestamps()
   }
 
   stages {
@@ -31,20 +38,21 @@ pipeline {
         sh '''
           set -euo pipefail
 
-          # minikube
+          # --- Minikube ---
           if ! command -v minikube >/dev/null 2>&1; then
             curl -fsSL https://storage.googleapis.com/minikube/releases/latest/minikube-linux-amd64 -o /usr/local/bin/minikube
             chmod +x /usr/local/bin/minikube
           fi
           minikube version || true
 
-          # kubectl
+          # --- kubectl ---
           if ! command -v kubectl >/dev/null 2>&1; then
             KVER="$(curl -fsSL https://dl.k8s.io/release/stable.txt)"
             curl -fsSL "https://dl.k8s.io/release/${KVER}/bin/linux/amd64/kubectl" -o /usr/local/bin/kubectl
             chmod +x /usr/local/bin/kubectl
           fi
 
+          # ensure dirs for kube/minikube live under workspace
           mkdir -p "${MINIKUBE_HOME}" "$(dirname "${KUBECONFIG}")"
         '''
       }
@@ -54,17 +62,22 @@ pipeline {
       steps {
         sh '''
           set -euo pipefail
-          # If cluster isn't up, start it
+
+          # If previous profile is broken, uncomment next line to reset:
+          # minikube -p minikube delete || true
+
           if ! minikube -p minikube status >/dev/null 2>&1; then
             minikube start -p minikube \
               --driver=docker \
               --container-runtime=containerd \
-              --kubernetes-version=stable
+              --kubernetes-version=stable \
+              --force \
+              --wait=all
           fi
 
-          # Show node to confirm connectivity
-          kubectl get nodes -o wide
+          # Sanity
           kubectl config current-context
+          kubectl get nodes -o wide
         '''
       }
     }
@@ -73,7 +86,7 @@ pipeline {
       steps {
         script {
           env.TAG   = sh(returnStdout: true, script: 'git rev-parse --short HEAD').trim()
-          env.IMAGE = "${env.APP}:${env.TAG}"
+          env.IMAGE = "${env.APP}:${env.TAG}"   // local tag; loaded into minikube
           echo "IMAGE=${env.IMAGE}"
         }
       }
@@ -82,7 +95,11 @@ pipeline {
     stage('Build Docker Image (local)') {
       steps {
         dir(env.DOCKER_CTX) {
-          sh "docker build -t ${IMAGE} ."
+          sh '''
+            set -euo pipefail
+            # Build with legacy builder or BuildKit; legacy is fine for CI here
+            docker build -t '"'"${IMAGE}"'"' .
+          '''
         }
       }
     }
@@ -91,9 +108,9 @@ pipeline {
       steps {
         sh '''
           set -euo pipefail
-          # Load local image into the Minikube node’s runtime
+          # Load the locally built image into the Minikube node runtime
           minikube -p minikube image load '"'"${IMAGE}"'"'
-          # (Optional) verify image now exists inside the node
+          # Optional: verify it reached containerd inside the node
           minikube -p minikube ssh -- "ctr -n=k8s.io images ls | grep ${APP} || true"
         '''
       }
@@ -103,18 +120,34 @@ pipeline {
       steps {
         sh """
           set -euo pipefail
+
+          # Apply k8s YAMLs
           kubectl -n ${NS} apply -f ${MANIFEST_DIR}/deployment.yaml
           kubectl -n ${NS} apply -f ${MANIFEST_DIR}/service.yaml
 
-          # Ensure the Deployment points to our freshly loaded image tag
+          # Make sure deployment points to our freshly loaded tag
           kubectl -n ${NS} set image deploy/${DEPLOY} ${CTR}=${IMAGE}
 
+          # Wait for rollout
           kubectl -n ${NS} rollout status deploy/${DEPLOY} --timeout=180s
+
+          # Debug info
           kubectl -n ${NS} get deploy ${DEPLOY} -o wide
           kubectl -n ${NS} get pods -o wide
           kubectl -n ${NS} get svc
         """
       }
+    }
+  }
+
+  post {
+    always {
+      echo "Pipeline finished (success or failure)."
+    }
+    failure {
+      echo "Diagnose with: minikube logs --file=logs.txt"
+      sh 'minikube -p minikube logs --file=logs.txt || true'
+      archiveArtifacts artifacts: 'logs.txt', onlyIfSuccessful: false, allowEmptyArchive: true
     }
   }
 }
