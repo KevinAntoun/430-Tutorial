@@ -6,12 +6,16 @@ pipeline {
   }
 
   environment {
-    NS          = 'default'
-    APP         = 'mydjangoapp'
-    DEPLOY      = 'django-deployment' // metadata.name in deployment.yaml
-    CTR         = 'web'               // containers[].name in deployment.yaml
-    DOCKER_CTX  = 'ps2'               // where your Dockerfile is
-    MANIFEST_DIR= 'ps2'               // where deployment.yaml/service.yaml are (use '.' if at repo root)
+    NS           = 'default'
+    APP          = 'mydjangoapp'
+    DEPLOY       = 'django-deployment'
+    CTR          = 'web'
+    DOCKER_CTX   = 'ps2'
+    MANIFEST_DIR = 'ps2'
+
+    // Make minikube + kubeconfig live in the workspace (persist across steps)
+    MINIKUBE_HOME = "${WORKSPACE}/.minikube"
+    KUBECONFIG    = "${WORKSPACE}/.kube/config"
   }
 
   stages {
@@ -22,15 +26,45 @@ pipeline {
       }
     }
 
-    stage('Install minikube CLI (once per container)') {
+    stage('Install CLIs (once)') {
       steps {
         sh '''
-          set -e
+          set -euo pipefail
+
+          # minikube
           if ! command -v minikube >/dev/null 2>&1; then
             curl -fsSL https://storage.googleapis.com/minikube/releases/latest/minikube-linux-amd64 -o /usr/local/bin/minikube
             chmod +x /usr/local/bin/minikube
           fi
           minikube version || true
+
+          # kubectl
+          if ! command -v kubectl >/dev/null 2>&1; then
+            KVER="$(curl -fsSL https://dl.k8s.io/release/stable.txt)"
+            curl -fsSL "https://dl.k8s.io/release/${KVER}/bin/linux/amd64/kubectl" -o /usr/local/bin/kubectl
+            chmod +x /usr/local/bin/kubectl
+          fi
+
+          mkdir -p "${MINIKUBE_HOME}" "$(dirname "${KUBECONFIG}")"
+        '''
+      }
+    }
+
+    stage('Start Minikube (once per workspace)') {
+      steps {
+        sh '''
+          set -euo pipefail
+          # If cluster isn't up, start it
+          if ! minikube -p minikube status >/dev/null 2>&1; then
+            minikube start -p minikube \
+              --driver=docker \
+              --container-runtime=containerd \
+              --kubernetes-version=stable
+          fi
+
+          # Show node to confirm connectivity
+          kubectl get nodes -o wide
+          kubectl config current-context
         '''
       }
     }
@@ -39,7 +73,7 @@ pipeline {
       steps {
         script {
           env.TAG   = sh(returnStdout: true, script: 'git rev-parse --short HEAD').trim()
-          env.IMAGE = "${env.APP}:${env.TAG}"   // local tag; we load into Minikube
+          env.IMAGE = "${env.APP}:${env.TAG}"
           echo "IMAGE=${env.IMAGE}"
         }
       }
@@ -55,19 +89,30 @@ pipeline {
 
     stage('Load Image into Minikube') {
       steps {
-        sh "minikube image load ${IMAGE}"
+        sh '''
+          set -euo pipefail
+          # Load local image into the Minikube node’s runtime
+          minikube -p minikube image load '"'"${IMAGE}"'"'
+          # (Optional) verify image now exists inside the node
+          minikube -p minikube ssh -- "ctr -n=k8s.io images ls | grep ${APP} || true"
+        '''
       }
     }
 
     stage('Apply Manifests & Rollout') {
       steps {
         sh """
+          set -euo pipefail
           kubectl -n ${NS} apply -f ${MANIFEST_DIR}/deployment.yaml
           kubectl -n ${NS} apply -f ${MANIFEST_DIR}/service.yaml
+
+          # Ensure the Deployment points to our freshly loaded image tag
           kubectl -n ${NS} set image deploy/${DEPLOY} ${CTR}=${IMAGE}
+
           kubectl -n ${NS} rollout status deploy/${DEPLOY} --timeout=180s
           kubectl -n ${NS} get deploy ${DEPLOY} -o wide
-          kubectl -n ${NS} get pods -n ${NS} -o wide
+          kubectl -n ${NS} get pods -o wide
+          kubectl -n ${NS} get svc
         """
       }
     }
