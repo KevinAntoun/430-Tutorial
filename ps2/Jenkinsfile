@@ -17,6 +17,10 @@ pipeline {
     // Persist cluster config/state across stages in this workspace
     MINIKUBE_HOME = "${WORKSPACE}/.minikube"
     KUBECONFIG    = "${WORKSPACE}/.kube/config"
+
+    // Dedicated network for Minikube (avoid clashes with default 192.168.49.0/24)
+    MK_DOCKER_NET = 'minikube-net'
+    MK_SUBNET     = '10.123.0.0/16'
   }
 
   options {
@@ -56,7 +60,48 @@ pipeline {
       }
     }
 
-    // PATCH A: Removed the "Prepare Docker network (avoid IP conflicts)" stage
+    stage('Prepare dedicated Docker network for Minikube') {
+      steps {
+        sh '''
+          set -euo pipefail
+
+          # 1) Fail fast if MK_SUBNET overlaps any existing Docker network
+          python3 - <<'PY'
+import ipaddress, json, subprocess, sys
+mk = ipaddress.ip_network("${MK_SUBNET}", strict=False)
+inspect = subprocess.check_output(
+    "docker network ls -q | xargs -r docker network inspect", shell=True, text=True
+)
+nets = json.loads(inspect) if inspect.strip() else []
+for n in nets:
+    cfgs = (n.get("IPAM",{}) or {}).get("Config",[]) or []
+    for c in cfgs:
+        s = c.get("Subnet")
+        if not s: 
+            continue
+        try:
+            nw = ipaddress.ip_network(s, strict=False)
+        except ValueError:
+            continue
+        if mk.overlaps(nw) and n.get("Name") != "${MK_DOCKER_NET}":
+            print(f"ERROR: ${MK_SUBNET} overlaps with existing network '{n.get('Name')}' ({nw})")
+            sys.exit(1)
+print("No overlaps detected for ${MK_SUBNET}")
+PY
+
+          # 2) Create the dedicated network if it doesn't exist
+          if ! docker network inspect "${MK_DOCKER_NET}" >/dev/null 2>&1; then
+            docker network create \
+              --driver=bridge \
+              --subnet="${MK_SUBNET}" \
+              "${MK_DOCKER_NET}"
+          fi
+
+          echo "Using Docker network: ${MK_DOCKER_NET} (${MK_SUBNET})"
+          docker network inspect "${MK_DOCKER_NET}" -f '{{.Name}} {{range .IPAM.Config}}{{.Subnet}}{{end}}'
+        '''
+      }
+    }
 
     stage('Start Minikube (once per workspace)') {
       steps {
@@ -66,12 +111,15 @@ pipeline {
           # Clean any old/broken profile to avoid collisions
           minikube -p minikube delete || true
 
-          # PATCH A: Let Minikube manage networking; do NOT force a Docker network
-          # and do NOT try to remove the 'minikube' network (Jenkins may be attached).
+          # IMPORTANT:
+          # - We DO NOT remove any pre-existing 'minikube' Docker network,
+          #   because the Jenkins container/agent might be attached to it.
+          # - We force Minikube to use our dedicated network to avoid route/subnet clashes.
           minikube start -p minikube \
             --driver=docker \
             --container-runtime=containerd \
             --kubernetes-version=stable \
+            --docker-opt=network=${MK_DOCKER_NET} \
             --delete-on-failure \
             --force \
             --wait=all
@@ -142,8 +190,8 @@ pipeline {
       echo "Collecting Minikube & network logs for debugging…"
       sh 'minikube -p minikube logs --file=logs.txt || true'
       archiveArtifacts artifacts: 'logs.txt', onlyIfSuccessful: false, allowEmptyArchive: true
-      // Keep a general network listing for context; no custom network inspect anymore.
       sh 'docker network ls || true'
+      sh 'docker network inspect "${MK_DOCKER_NET}" || true'
     }
   }
 }
