@@ -89,15 +89,28 @@ pipeline {
         sh '''
           set -euo pipefail
 
-          # Clean any old/broken profile to avoid collisions
+          # Clean any old/broken Minikube profile
           minikube -p minikube delete || true
 
-          # Force Minikube onto the dedicated network to avoid host route/subnet clashes
+          # If a leftover Docker network named "minikube" exists AND is empty, remove it.
+          # (Minikube sometimes leaves this behind; it can keep conflicting IP ranges alive.)
+          if docker network inspect minikube >/dev/null 2>&1; then
+            CONTAINERS_JSON="$(docker network inspect minikube -f '{{json .Containers}}' || echo '{}')"
+            if [ "${CONTAINERS_JSON}" = "{}" ]; then
+              echo "Removing stale empty Docker network 'minikube' to avoid IP conflicts..."
+              docker network rm minikube || true
+            else
+              echo "Docker network 'minikube' has attached containers; leaving it in place."
+            fi
+          fi
+
+          # IMPORTANT: Force Minikube to use our existing Docker network directly.
+          # This avoids creation of the default 192.168.49.0/24 'minikube' network.
           minikube start -p minikube \
             --driver=docker \
             --container-runtime=containerd \
             --kubernetes-version=stable \
-            --docker-opt=network=${MK_DOCKER_NET} \
+            --docker-network=${MK_DOCKER_NET} \
             --delete-on-failure \
             --force \
             --wait=all
