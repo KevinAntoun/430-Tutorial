@@ -20,8 +20,7 @@ pipeline {
   }
 
   options {
-    // show full command logs
-    ansiColor('xterm')
+    // Keep it simple; remove ansiColor since your controller doesn't support it here
     timestamps()
   }
 
@@ -63,7 +62,7 @@ pipeline {
         sh '''
           set -euo pipefail
 
-          # If previous profile is broken, uncomment next line to reset:
+          # If a prior broken profile causes trouble, uncomment:
           # minikube -p minikube delete || true
 
           if ! minikube -p minikube status >/dev/null 2>&1; then
@@ -75,7 +74,6 @@ pipeline {
               --wait=all
           fi
 
-          # Sanity
           kubectl config current-context
           kubectl get nodes -o wide
         '''
@@ -97,7 +95,6 @@ pipeline {
         dir(env.DOCKER_CTX) {
           sh '''
             set -euo pipefail
-            # Build with legacy builder or BuildKit; legacy is fine for CI here
             docker build -t '"'"${IMAGE}"'"' .
           '''
         }
@@ -108,9 +105,8 @@ pipeline {
       steps {
         sh '''
           set -euo pipefail
-          # Load the locally built image into the Minikube node runtime
           minikube -p minikube image load '"'"${IMAGE}"'"'
-          # Optional: verify it reached containerd inside the node
+          # Optional visibility: confirm it inside containerd
           minikube -p minikube ssh -- "ctr -n=k8s.io images ls | grep ${APP} || true"
         '''
       }
@@ -121,17 +117,13 @@ pipeline {
         sh """
           set -euo pipefail
 
-          # Apply k8s YAMLs
           kubectl -n ${NS} apply -f ${MANIFEST_DIR}/deployment.yaml
           kubectl -n ${NS} apply -f ${MANIFEST_DIR}/service.yaml
 
-          # Make sure deployment points to our freshly loaded tag
           kubectl -n ${NS} set image deploy/${DEPLOY} ${CTR}=${IMAGE}
 
-          # Wait for rollout
           kubectl -n ${NS} rollout status deploy/${DEPLOY} --timeout=180s
 
-          # Debug info
           kubectl -n ${NS} get deploy ${DEPLOY} -o wide
           kubectl -n ${NS} get pods -o wide
           kubectl -n ${NS} get svc
@@ -145,7 +137,7 @@ pipeline {
       echo "Pipeline finished (success or failure)."
     }
     failure {
-      echo "Diagnose with: minikube logs --file=logs.txt"
+      echo "Collecting Minikube logs for debugging…"
       sh 'minikube -p minikube logs --file=logs.txt || true'
       archiveArtifacts artifacts: 'logs.txt', onlyIfSuccessful: false, allowEmptyArchive: true
     }
