@@ -64,12 +64,8 @@ pipeline {
       steps {
         sh '''
           set -euo pipefail
-          # Create dedicated Docker network if missing, on a non-conflicting subnet
           if ! docker network inspect "${MK_DOCKER_NET}" >/dev/null 2>&1; then
-            docker network create \
-              --driver=bridge \
-              --subnet="${MK_SUBNET}" \
-              "${MK_DOCKER_NET}"
+            docker network create --driver=bridge --subnet="${MK_SUBNET}" "${MK_DOCKER_NET}"
           fi
           echo "Using Docker network: ${MK_DOCKER_NET} (${MK_SUBNET})"
           docker network inspect "${MK_DOCKER_NET}" -f '{{.Name}} {{index .IPAM.Config 0 "Subnet"}}'
@@ -82,19 +78,19 @@ pipeline {
         sh '''
           set -euo pipefail
 
-          # If a prior broken profile causes trouble, uncomment:
-          # minikube -p minikube delete || true
+          # Clean any old/broken profile and Docker network leftovers to avoid collisions
+          minikube -p minikube delete || true
+          docker network rm minikube || true
 
-          if ! minikube -p minikube status >/dev/null 2>&1; then
-            minikube start -p minikube \
-              --driver=docker \
-              --container-runtime=containerd \
-              --kubernetes-version=stable \
-              --docker-network="${MK_DOCKER_NET}" \
-              --delete-on-failure \
-              --force \
-              --wait=all
-          fi
+          # Start and pin the cluster to our custom docker network via --docker-opt
+          minikube start -p minikube \
+            --driver=docker \
+            --container-runtime=containerd \
+            --kubernetes-version=stable \
+            --docker-opt=network=${MK_DOCKER_NET} \
+            --delete-on-failure \
+            --force \
+            --wait=all
 
           kubectl config current-context
           kubectl get nodes -o wide
@@ -128,7 +124,7 @@ pipeline {
         sh '''
           set -euo pipefail
           minikube -p minikube image load '"'"${IMAGE}"'"'
-          # Optional visibility: confirm it inside containerd
+          # Optional: confirm it inside containerd on the node
           minikube -p minikube ssh -- "ctr -n=k8s.io images ls | grep ${APP} || true"
         '''
       }
@@ -159,7 +155,7 @@ pipeline {
       echo "Pipeline finished (success or failure)."
     }
     failure {
-      echo "Collecting Minikube logs for debugging…"
+      echo "Collecting Minikube & network logs for debugging…"
       sh 'minikube -p minikube logs --file=logs.txt || true'
       archiveArtifacts artifacts: 'logs.txt', onlyIfSuccessful: false, allowEmptyArchive: true
       sh 'docker network ls || true'
