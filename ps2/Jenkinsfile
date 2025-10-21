@@ -17,10 +17,6 @@ pipeline {
     // Persist cluster config/state across stages in this workspace
     MINIKUBE_HOME = "${WORKSPACE}/.minikube"
     KUBECONFIG    = "${WORKSPACE}/.kube/config"
-
-    // Custom Docker network to avoid IP/subnet clashes
-    MK_DOCKER_NET = 'mk-net'
-    MK_SUBNET     = '172.25.0.0/16'
   }
 
   options {
@@ -60,34 +56,22 @@ pipeline {
       }
     }
 
-    stage('Prepare Docker network (avoid IP conflicts)') {
-      steps {
-        sh '''
-          set -euo pipefail
-          if ! docker network inspect "${MK_DOCKER_NET}" >/dev/null 2>&1; then
-            docker network create --driver=bridge --subnet="${MK_SUBNET}" "${MK_DOCKER_NET}"
-          fi
-          echo "Using Docker network: ${MK_DOCKER_NET} (${MK_SUBNET})"
-          docker network inspect "${MK_DOCKER_NET}" -f '{{.Name}} {{index .IPAM.Config 0 "Subnet"}}'
-        '''
-      }
-    }
+    // PATCH A: Removed the "Prepare Docker network (avoid IP conflicts)" stage
 
     stage('Start Minikube (once per workspace)') {
       steps {
         sh '''
           set -euo pipefail
 
-          # Clean any old/broken profile and Docker network leftovers to avoid collisions
+          # Clean any old/broken profile to avoid collisions
           minikube -p minikube delete || true
-          docker network rm minikube || true
 
-          # Start and pin the cluster to our custom docker network via --docker-opt
+          # PATCH A: Let Minikube manage networking; do NOT force a Docker network
+          # and do NOT try to remove the 'minikube' network (Jenkins may be attached).
           minikube start -p minikube \
             --driver=docker \
             --container-runtime=containerd \
             --kubernetes-version=stable \
-            --docker-opt=network=${MK_DOCKER_NET} \
             --delete-on-failure \
             --force \
             --wait=all
@@ -158,8 +142,8 @@ pipeline {
       echo "Collecting Minikube & network logs for debugging…"
       sh 'minikube -p minikube logs --file=logs.txt || true'
       archiveArtifacts artifacts: 'logs.txt', onlyIfSuccessful: false, allowEmptyArchive: true
+      # Keep a general network listing for context; no custom network inspect anymore.
       sh 'docker network ls || true'
-      sh 'docker network inspect "${MK_DOCKER_NET}" || true'
     }
   }
 }
