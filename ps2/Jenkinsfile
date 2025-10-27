@@ -43,27 +43,10 @@ pipeline {
       steps {
         sh '''
           set -euo pipefail
-
-          # --- Minikube ---
-          if ! command -v minikube >/dev/null 2>&1; then
-            curl -fsSL https://storage.googleapis.com/minikube/releases/latest/minikube-linux-amd64 -o /usr/local/bin/minikube
-            chmod +x /usr/local/bin/minikube
-          fi
-          minikube version || true
-
-          # --- kubectl ---
-          if ! command -v kubectl >/dev/null 2>&1; then
-            KVER="$(curl -fsSL https://dl.k8s.io/release/stable.txt)"
-            curl -fsSL "https://dl.k8s.io/release/${KVER}/bin/linux/amd64/kubectl" -o /usr/local/bin/kubectl
-            chmod +x /usr/local/bin/kubectl
-          fi
-          
-          # --- socat for network bridge ---
-          if ! command -v socat >/dev/null 2>&1; then
-            apt-get update -y && apt-get install -y --no-install-recommends socat
-          fi
-
-          # ensure dirs for kube/minikube live under workspace
+          # Install necessary tools if they are not present
+          if ! command -v minikube >/dev/null 2>&1; then curl -fsSL https://storage.googleapis.com/minikube/releases/latest/minikube-linux-amd64 -o /usr/local/bin/minikube && chmod +x /usr/local/bin/minikube; fi
+          if ! command -v kubectl >/dev/null 2>&1; then KVER="$(curl -fsSL https://dl.k8s.io/release/stable.txt)"; curl -fsSL "https://dl.k8s.io/release/${KVER}/bin/linux/amd64/kubectl" -o /usr/local/bin/kubectl && chmod +x /usr/local/bin/kubectl; fi
+          if ! command -v socat >/dev/null 2>&1; then apt-get update -y && apt-get install -y --no-install-recommends socat; fi
           mkdir -p "${MINIKUBE_HOME}" "$(dirname "${KUBECONFIG}")"
         '''
       }
@@ -73,10 +56,7 @@ pipeline {
       steps {
         sh '''
           set -euo pipefail
-
-          if docker network inspect "${MK_DOCKER_NET}" >/dev/null 2>&1; then
-            echo "Using existing Docker network: ${MK_DOCKER_NET}"
-          else
+          if ! docker network inspect "${MK_DOCKER_NET}" >/dev/null 2>&1; then
             echo "Creating Docker network: ${MK_DOCKER_NET} (${MK_SUBNET})"
             docker network create --driver=bridge --subnet="${MK_SUBNET}" "${MK_DOCKER_NET}"
           fi
@@ -90,7 +70,6 @@ pipeline {
           set -euo pipefail
 
           # --- Start the Robust Port Forwarding Bridge ---
-          # This is required on EVERY run to enable communication. It starts in the background.
           cat > /tmp/minikube_port_bridge.sh <<'EOSH'
 #!/usr/bin/env bash
 set -euo pipefail
@@ -112,28 +91,38 @@ done
 EOSH
           chmod +x /tmp/minikube_port_bridge.sh
           nohup /tmp/minikube_port_bridge.sh >/tmp/port-bridge.log 2>&1 &
-          sleep 1 # Give the bridge a moment to start
 
           # --- Check if Minikube is already running ---
-          if minikube status -p minikube >/dev/null 2>&1; then
+          if minikube status -p minikube | grep -q "Running"; then
             echo "Reusing existing, running Minikube cluster."
             minikube -p minikube update-context
           else
             echo "No running Minikube found. Starting a new cluster..."
             
+            # Clean up potential leftovers
             minikube delete -p minikube || true
             rm -rf "${MINIKUBE_HOME}/cache/preloaded-tarball"
 
-            minikube start -p minikube \\
+            # PHASE 1: Create the container but DO NOT provision it yet. This creates the port mappings.
+            echo "Phase 1: Creating Minikube container without provisioning..."
+            minikube start -p minikube --no-provision \\
               --driver=docker \\
               --container-runtime=containerd \\
               --kubernetes-version=v1.30.0 \\
               --cpus=2 --memory=4096 \\
               --network="${MK_DOCKER_NET}" \\
-              --delete-on-failure \\
-              --wait=all \\
-              --force \\
-              -v=3 --alsologtostderr
+              --force
+            
+            # Give the bridge a few seconds to detect the new ports and start forwarding.
+            echo "Waiting for network bridge to activate..."
+            sleep 5
+
+            # PHASE 2: Provision the cluster. The bridge is now active, so SSH will work.
+            echo "Phase 2: Provisioning Kubernetes inside the container..."
+            minikube provision -p minikube
+            
+            # Final step to wait for the cluster to be fully ready.
+            minikube -p minikube kubectl -- wait --for=condition=Ready node --all --timeout=5m
           fi
 
           # Final verification to ensure the cluster is responsive
@@ -157,21 +146,14 @@ EOSH
     stage('Build Docker Image (local)') {
       steps {
         dir(env.DOCKER_CTX) {
-          sh '''
-            set -euo pipefail
-            docker build -t "${IMAGE}" .
-          '''
+          sh 'docker build -t "${IMAGE}" .'
         }
       }
     }
 
     stage('Load Image into Minikube') {
       steps {
-        sh '''
-          set -euo pipefail
-          minikube -p minikube image load "${IMAGE}"
-          minikube -p minikube ssh -- "ctr -n=k8s.io images ls | grep ${APP} || true"
-        '''
+        sh 'minikube -p minikube image load "${IMAGE}"'
       }
     }
 
@@ -183,9 +165,7 @@ EOSH
           kubectl -n ${NS} apply -f ${MANIFEST_DIR}/service.yaml
           kubectl -n ${NS} set image deploy/${DEPLOY} ${CTR}=${IMAGE}
           kubectl -n ${NS} rollout status deploy/${DEPLOY} --timeout=180s
-          kubectl -n ${NS} get deploy ${DEPLOY} -o wide
-          kubectl -n ${NS} get pods -o wide
-          kubectl -n ${NS} get svc
+          kubectl -n ${NS} get deploy,pods,svc -o wide
         """
       }
     }
@@ -193,15 +173,14 @@ EOSH
 
   post {
     always {
-      echo 'Pipeline finished (success or failure).'
-      echo 'Cleaning up port bridge (best effort)...'
+      echo 'Pipeline finished. Cleaning up port bridge...'
       sh 'pkill -f minikube_port_bridge.sh || true'
       sh 'pkill -f "socat TCP-LISTEN" || true'
     }
     failure {
       echo 'Collecting Minikube & network logs for debugging…'
       sh 'minikube -p minikube logs --file=logs.txt || true'
-      archiveArtifacts artifacts: 'logs.txt', onlyIfSuccessful: false, allowEmptyArchive: true
+      archiveArtifacts artifacts: 'logs.txt', allowEmptyArchive: true
       sh 'docker network ls || true'
       sh 'docker network inspect "${MK_DOCKER_NET}" || true'
       sh 'echo "[BRIDGE LOGS]"; cat /tmp/port-bridge.log || true'
