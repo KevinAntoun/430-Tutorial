@@ -57,6 +57,11 @@ pipeline {
             curl -fsSL "https://dl.k8s.io/release/${KVER}/bin/linux/amd64/kubectl" -o /usr/local/bin/kubectl
             chmod +x /usr/local/bin/kubectl
           fi
+          
+          # --- socat for network bridge ---
+          if ! command -v socat >/dev/null 2>&1; then
+            apt-get update -y && apt-get install -y --no-install-recommends socat
+          fi
 
           # ensure dirs for kube/minikube live under workspace
           mkdir -p "${MINIKUBE_HOME}" "$(dirname "${KUBECONFIG}")"
@@ -73,60 +78,62 @@ pipeline {
             echo "Using existing Docker network: ${MK_DOCKER_NET}"
           else
             echo "Creating Docker network: ${MK_DOCKER_NET} (${MK_SUBNET})"
-            if ! docker network create --driver=bridge --subnet="${MK_SUBNET}" "${MK_DOCKER_NET}"; then
-              echo "ERROR: Failed to create ${MK_DOCKER_NET} on ${MK_SUBNET} (likely subnet conflict)."
-              echo "Existing networks:"
-              docker network ls
-              echo "Details:"
-              docker network ls -q | xargs -r docker network inspect -f '{{.Name}} {{range .IPAM.Config}}{{.Subnet}}{{end}}'
-              exit 2
-            fi
+            docker network create --driver=bridge --subnet="${MK_SUBNET}" "${MK_DOCKER_NET}"
           fi
-
-          docker network inspect "${MK_DOCKER_NET}" -f '{{.Name}} {{range .IPAM.Config}}{{.Subnet}}{{end}}'
         '''
       }
     }
 
-    stage('Start Minikube') {
+    stage('Start Minikube (with localhost bridge)') {
       steps {
         sh '''
           set -euo pipefail
 
-          # Reuse existing Minikube if it's already running, otherwise start it
-          if minikube -p minikube status >/dev/null 2>&1; then
-            echo "Reusing existing and running Minikube cluster."
-            # Ensure context is up-to-date
-            minikube -p minikube update-context
-          else
-            echo "No existing Minikube cluster found or it is not running; starting a new one..."
-            minikube start -p minikube \\
-              --driver=docker \\
-              --container-runtime=containerd \\
-              --kubernetes-version=v1.30.0 \\
-              --cpus=2 --memory=4096 \\
-              --network="${MK_DOCKER_NET}" \\
-              --delete-on-failure \\
-              --wait=all \\
-              --force \\
-              --listen-address=0.0.0.0 \\
-              -v=3 --alsologtostderr
-          fi
+          # Clean up any previous Minikube instance to ensure a fresh start
+          minikube delete -p minikube || true
+
+          # Clean the preload cache to prevent "tar: ... is a directory" error
+          rm -rf "${MINIKUBE_HOME}/cache/preloaded-tarball"
           
-          # Explicitly wait for the API server to be reachable before proceeding
-          echo "Waiting for Kubernetes API server to be ready..."
-          ATTEMPTS=0
-          MAX_ATTEMPTS=60
-          until kubectl get nodes &> /dev/null; do
-            if [ $ATTEMPTS -eq $MAX_ATTEMPTS ]; then
-              echo "API server did not become ready in time."
-              exit 1
-            fi
-            echo "Still waiting for API server... ($((ATTEMPTS+1))/${MAX_ATTEMPTS})"
-            ATTEMPTS=$((ATTEMPTS+1))
-            sleep 2
-          done
-          echo "Kubernetes API server is ready."
+          # --- Robust Port Forwarding Bridge ---
+          # This script finds ALL ports mapped by the minikube container and forwards
+          # them from the Jenkins container's localhost to the Docker host. This is
+          # essential for both minikube's internal SSH and kubectl to work correctly.
+          cat > /tmp/minikube_port_bridge.sh <<'EOSH'
+#!/usr/bin/env bash
+set -euo pipefail
+declare -A BRIDGED_PORTS
+while true; do
+  # Get a list of "container_port -> host_port" (e.g., 22/tcp -> 0.0.0.0:49156)
+  PORT_MAPS=$(docker port minikube 2>/dev/null || true)
+  
+  if [[ -n "$PORT_MAPS" ]]; then
+    while read -r line; do
+      HOST_PORT=$(echo "$line" | awk -F: '{print $2}')
+      if [[ -n "$HOST_PORT" && -z "${BRIDGED_PORTS[$HOST_PORT]:-}" ]]; then
+        nohup socat TCP-LISTEN:${HOST_PORT},fork,reuseaddr TCP:host.docker.internal:${HOST_PORT} >/tmp/socat-${HOST_PORT}.log 2>&1 &
+        BRIDGED_PORTS[$HOST_PORT]=true
+        echo "[BRIDGE] Forwarding container localhost:${HOST_PORT} -> host.docker.internal:${HOST_PORT}"
+      fi
+    done <<< "$PORT_MAPS"
+  fi
+  sleep 2
+done
+EOSH
+          chmod +x /tmp/minikube_port_bridge.sh
+          nohup /tmp/minikube_port_bridge.sh >/tmp/port-bridge.log 2>&1 &
+          
+          # Start Minikube on our dedicated Docker network
+          minikube start -p minikube \\
+            --driver=docker \\
+            --container-runtime=containerd \\
+            --kubernetes-version=v1.30.0 \\
+            --cpus=2 --memory=4096 \\
+            --network="${MK_DOCKER_NET}" \\
+            --delete-on-failure \\
+            --wait=all \\
+            --force \\
+            -v=3 --alsologtostderr
 
           kubectl config current-context
           kubectl get nodes -o wide
@@ -189,6 +196,9 @@ pipeline {
   post {
     always {
       echo 'Pipeline finished (success or failure).'
+      echo 'Cleaning up port bridge (best effort)...'
+      sh 'pkill -f minikube_port_bridge.sh || true'
+      sh 'pkill -f "socat TCP-LISTEN" || true'
     }
     failure {
       echo 'Collecting Minikube & network logs for debugging…'
@@ -196,6 +206,7 @@ pipeline {
       archiveArtifacts artifacts: 'logs.txt', onlyIfSuccessful: false, allowEmptyArchive: true
       sh 'docker network ls || true'
       sh 'docker network inspect "${MK_DOCKER_NET}" || true'
+      sh 'cat /tmp/port-bridge.log || true'
     }
   }
 }
