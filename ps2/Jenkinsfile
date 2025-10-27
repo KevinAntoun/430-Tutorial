@@ -21,6 +21,9 @@ pipeline {
     // Dedicated network for Minikube (avoid clashes with defaults)
     MK_DOCKER_NET = 'minikube-net'
     MK_SUBNET     = '10.123.0.0/16'
+
+    // >>> important: correct var name (no "A")
+    MINIKUBE_IN_CONTAINER = 'true'
   }
 
   options { timestamps() }
@@ -69,9 +72,7 @@ pipeline {
             echo "Creating Docker network: ${MK_DOCKER_NET} (${MK_SUBNET})"
             if ! docker network create --driver=bridge --subnet="${MK_SUBNET}" "${MK_DOCKER_NET}"; then
               echo "ERROR: Failed to create ${MK_DOCKER_NET} on ${MK_SUBNET} (likely subnet conflict)."
-              echo "Existing networks:"
               docker network ls
-              echo "Details:"
               docker network ls -q | xargs -r docker network inspect -f '{{.Name}} {{range .IPAM.Config}}{{.Subnet}}{{end}}'
               exit 2
             fi
@@ -101,7 +102,14 @@ pipeline {
             fi
           fi
 
-          export MINIKUBE_IN_A_CONTAINER=true
+          # IMPORTANT: prevent the default 192.168.49.0/24 network from conflicting
+          if docker network inspect minikube >/dev/null 2>&1; then
+            docker network disconnect minikube jenkins || true
+            docker network rm minikube || true
+          fi
+
+          # Run Minikube in Docker (kic), pin k8s version; bind to our custom network.
+          # NOTE: MINIKUBE_IN_CONTAINER=true (set in env) tells Minikube it runs inside a containerized CI.
           minikube start -p minikube \
             --driver=docker \
             --container-runtime=containerd \
@@ -112,8 +120,10 @@ pipeline {
             --delete-on-failure \
             --wait=all \
             --force \
+            --listen-address=0.0.0.0 \
             -v=3 --alsologtostderr
 
+          echo "Current kubectl context:"
           kubectl config current-context
           kubectl get nodes -o wide
         '''
@@ -180,6 +190,9 @@ pipeline {
       echo "Collecting Minikube & network logs for debugging…"
       sh 'minikube -p minikube logs --file=logs.txt || true'
       archiveArtifacts artifacts: 'logs.txt', onlyIfSuccessful: false, allowEmptyArchive: true
+      sh 'docker ps -a || true'
+      sh 'docker logs minikube || true'
+      sh 'docker inspect minikube || true'
       sh 'docker network ls || true'
       sh 'docker network inspect "${MK_DOCKER_NET}" || true'
     }
