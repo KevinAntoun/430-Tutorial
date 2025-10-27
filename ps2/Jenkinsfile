@@ -110,10 +110,11 @@ pipeline {
             --driver=docker \
             --container-runtime=containerd \
             --kubernetes-version=stable \
-            --docker-network=${MK_DOCKER_NET} \
+            --network=${MK_DOCKER_NET} \
             --delete-on-failure \
             --force \
             --wait=all
+
 
           kubectl config current-context
           kubectl get nodes -o wide
