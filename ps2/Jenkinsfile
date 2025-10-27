@@ -206,7 +206,7 @@ EOSH
       archiveArtifacts artifacts: 'logs.txt', onlyIfSuccessful: false, allowEmptyArchive: true
       sh 'docker network ls || true'
       sh 'docker network inspect "${MK_DOCKER_NET}" || true'
-      sh 'cat /tmp/port-bridge.log || true'
+      sh 'echo "[BRIDGE LOGS]"; cat /tmp/port-bridge.log || true'
     }
   }
 }
