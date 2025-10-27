@@ -21,19 +21,9 @@ pipeline {
     // Dedicated network for Minikube (avoid clashes with defaults)
     MK_DOCKER_NET = 'minikube-net'
     MK_SUBNET     = '10.123.0.0/16'
-
-    // We run Minikube inside a containerized CI
-    MINIKUBE_IN_A_CONTAINER = 'true'
-
-    // On a user-defined docker network, minikube uses a static container IP of .2
-    // We’ll force libmachine to SSH to the container directly instead of 127.0.0.1:<host-mapped-port>
-    MK_NODE_IP   = '10.123.0.2'
-    MK_SSH_PORT  = '22'
   }
 
-  options {
-    timestamps()
-  }
+  options { timestamps() }
 
   stages {
     stage('Checkout') {
@@ -111,26 +101,18 @@ pipeline {
             fi
           fi
 
-          # IMPORTANT: Force Minikube to use our existing Docker network directly.
-          # This avoids the default 192.168.49.0/24 network and gives the node a stable container IP (.2).
+          export MINIKUBE_IN_A_CONTAINER=true
           minikube start -p minikube \
             --driver=docker \
             --container-runtime=containerd \
             --kubernetes-version=v1.30.0 \
             --cpus=2 --memory=4096 \
-            --network="${MK_DOCKER_NET}" \
+            --network=${MK_DOCKER_NET} \
             --preload=false \
             --delete-on-failure \
             --wait=all \
             --force \
-            --listen-address=0.0.0.0 \
-            --ssh-ip="${MK_NODE_IP}" \
-            --ssh-port="${MK_SSH_PORT}" \
             -v=3 --alsologtostderr
-
-          echo "Minikube node reachable via container IP:"
-          # Prove SSH path works against container IP (not host loopback)
-          minikube -p minikube ssh -- "hostname && ip -4 addr show eth0 || true"
 
           kubectl config current-context
           kubectl get nodes -o wide
@@ -153,7 +135,7 @@ pipeline {
         dir(env.DOCKER_CTX) {
           sh '''
             set -euo pipefail
-            docker build -t "${IMAGE}" .
+            docker build -t '"'"${IMAGE}"'"' .
           '''
         }
       }
@@ -163,7 +145,7 @@ pipeline {
       steps {
         sh '''
           set -euo pipefail
-          minikube -p minikube image load "${IMAGE}"
+          minikube -p minikube image load '"'"${IMAGE}"'"'
           # Optional: confirm it inside containerd on the node
           minikube -p minikube ssh -- "ctr -n=k8s.io images ls | grep ${APP} || true"
         '''
