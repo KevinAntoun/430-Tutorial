@@ -113,7 +113,6 @@ pipeline {
           fi
 
          export MINIKUBE_IN_A_CONTAINER=true
-
           minikube start -p minikube \
             --driver=docker \
             --container-runtime=containerd \
@@ -122,7 +121,9 @@ pipeline {
             --network=${MK_DOCKER_NET} \
             --preload=false \
             --delete-on-failure \
-            --wait=all -v=3 --alsologtostderr
+            --wait=all \
+            --force \
+            -v=3 --alsologtostderr
 
 
 
