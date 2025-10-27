@@ -10,7 +10,7 @@ pipeline {
     NS            = 'default'
     APP           = 'mydjangoapp'
     DEPLOY        = 'django-deployment'   // metadata.name in deployment.yaml
-    CTR           = 'web'                 // containers[].name in deployment.yaml
+    CTR           = 'django-container'                 // containers[].name in deployment.yaml
     DOCKER_CTX    = 'ps2'                 // path containing Dockerfile
     MANIFEST_DIR  = 'ps2'                 // path containing deployment.yaml/service.yaml
 
