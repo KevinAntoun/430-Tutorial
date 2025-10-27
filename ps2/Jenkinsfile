@@ -88,67 +88,45 @@ pipeline {
       }
     }
 
-    stage('Start Minikube (with localhost SSH bridge)') {
+    stage('Start Minikube') {
       steps {
         sh '''
           set -euo pipefail
 
-          # Clean any old/broken Minikube profile
-          minikube -p minikube delete || true
-
-          # Remove stale default "minikube" Docker network if empty
-          if docker network inspect minikube >/dev/null 2>&1; then
-            CONTAINERS_JSON="$(docker network inspect minikube -f '{{json .Containers}}' || echo '{}')"
-            if [ "${CONTAINERS_JSON}" = "{}" ]; then
-              echo "Removing stale empty Docker network 'minikube'..."
-              docker network rm minikube || true
-            else
-              echo "Docker network 'minikube' has attached containers; leaving it in place."
+          # Reuse existing Minikube if it's already running, otherwise start it
+          if minikube -p minikube status >/dev/null 2>&1; then
+            echo "Reusing existing and running Minikube cluster."
+            # Ensure context is up-to-date
+            minikube -p minikube update-context
+          else
+            echo "No existing Minikube cluster found or it is not running; starting a new one..."
+            minikube start -p minikube \\
+              --driver=docker \\
+              --container-runtime=containerd \\
+              --kubernetes-version=v1.30.0 \\
+              --cpus=2 --memory=4096 \\
+              --network="${MK_DOCKER_NET}" \\
+              --delete-on-failure \\
+              --wait=all \\
+              --force \\
+              --listen-address=0.0.0.0 \\
+              -v=3 --alsologtostderr
+          fi
+          
+          # Explicitly wait for the API server to be reachable before proceeding
+          echo "Waiting for Kubernetes API server to be ready..."
+          ATTEMPTS=0
+          MAX_ATTEMPTS=60
+          until kubectl get nodes &> /dev/null; do
+            if [ $ATTEMPTS -eq $MAX_ATTEMPTS ]; then
+              echo "API server did not become ready in time."
+              exit 1
             fi
-          fi
-
-          # Ensure no conflicting default network remains
-          docker network inspect minikube >/dev/null 2>&1 && docker network rm minikube || true
-
-          # Ensure socat exists for SSH bridge
-          if ! command -v socat >/dev/null 2>&1; then
-            apt-get update -y && apt-get install -y --no-install-recommends socat || true
-          fi
-
-          # Launch SSH localhost bridge in background
-          cat > /tmp/minikube_ssh_bridge.sh <<'EOSH'
-#!/usr/bin/env bash
-set -euo pipefail
-BRIDGED_PORT=""
-while true; do
-  HP="$(docker container inspect -f '{{range $p,$v := .NetworkSettings.Ports}}{{if eq $p "22/tcp"}}{{(index $v 0).HostPort}}{{end}}{{end}}' minikube 2>/dev/null || true)"
-  if [[ -n "${HP:-}" ]]; then
-    if [[ "${HP}" != "${BRIDGED_PORT:-}" ]]; then
-      pkill -f "socat TCP-LISTEN:${BRIDGED_PORT}," >/dev/null 2>&1 || true
-      nohup socat TCP-LISTEN:${HP},fork,reuseaddr TCP:host.docker.internal:${HP} >/tmp/socat-${HP}.log 2>&1 &
-      BRIDGED_PORT="${HP}"
-      echo "Bridging 127.0.0.1:${HP} -> host.docker.internal:${HP}"
-    fi
-  fi
-  sleep 1
-done
-EOSH
-          chmod +x /tmp/minikube_ssh_bridge.sh
-          nohup /tmp/minikube_ssh_bridge.sh >/tmp/ssh-bridge.log 2>&1 &
-
-          # Start Minikube on our dedicated Docker network
-          minikube start -p minikube \
-            --driver=docker \
-            --container-runtime=containerd \
-            --kubernetes-version=v1.30.0 \
-            --cpus=2 --memory=4096 \
-            --network="${MK_DOCKER_NET}" \
-            --preload=false \
-            --delete-on-failure \
-            --wait=all \
-            --force \
-            --listen-address=0.0.0.0 \
-            -v=3 --alsologtostderr
+            echo "Still waiting for API server... ($((ATTEMPTS+1))/${MAX_ATTEMPTS})"
+            ATTEMPTS=$((ATTEMPTS+1))
+            sleep 2
+          done
+          echo "Kubernetes API server is ready."
 
           kubectl config current-context
           kubectl get nodes -o wide
@@ -171,7 +149,7 @@ EOSH
         dir(env.DOCKER_CTX) {
           sh '''
             set -euo pipefail
-            docker build -t '"'"${IMAGE}"'"' .
+            docker build -t "'"${IMAGE}"'" .
           '''
         }
       }
@@ -181,7 +159,7 @@ EOSH
       steps {
         sh '''
           set -euo pipefail
-          minikube -p minikube image load '"'"${IMAGE}"'"'
+          minikube -p minikube image load "'"${IMAGE}"'"
           # confirm it inside containerd on the node
           minikube -p minikube ssh -- "ctr -n=k8s.io images ls | grep ${APP} || true"
         '''
@@ -211,9 +189,6 @@ EOSH
   post {
     always {
       echo 'Pipeline finished (success or failure).'
-      echo 'Cleaning up SSH bridge (best effort)...'
-      sh 'pkill -f minikube_ssh_bridge.sh || true'
-      sh 'pkill -f "socat TCP-LISTEN" || true'
     }
     failure {
       echo 'Collecting Minikube & network logs for debugging…'
