@@ -45,6 +45,7 @@ pipeline {
           fi
           apt-get update -y
           apt-get install -y --no-install-recommends iproute2 socat
+          mkdir -p "${MINIKUBE_HOME}" "$(dirname "${KUBECONFIG}")"
         '''
       }
     }
@@ -122,7 +123,7 @@ EOSH
             fi
           fi
 
-          # --- explicit apiserver bridge + wait using socat as probe ---
+          # --- explicit apiserver bridge + POSIX wait using socat as probe ---
           API_HOST_PORT="$(docker port minikube 8443/tcp | awk -F':' '{print $NF}' | tail -n1 || true)"
           case "${API_HOST_PORT}" in
             ''|*[!0-9]*) 
@@ -223,6 +224,7 @@ EOSH
 export MK_ROOT="/var/jenkins_home/minikube/ps2"
 export MINIKUBE_HOME="${MK_ROOT}/.minikube"
 export KUBECONFIG="${MK_ROOT}/.kube/config"
+# harden against proxies
 unset HTTP_PROXY HTTPS_PROXY http_proxy https_proxy
 export NO_PROXY='127.0.0.1,localhost,.local,.svc,cluster.local,10.96.0.0/12,10.244.0.0/16,10.123.0.0/16'
 export no_proxy="${NO_PROXY}"
@@ -275,7 +277,7 @@ echo "Bridge stopped"
 EOS
           chmod +x /usr/local/bin/stop-ps2-bridge
 
-          # expose-django-service: use "minikube service --url", then publish that random port to Windows
+          # expose-django-service: USES 'minikube service --url' then forwards that random port to Windows
           cat > /usr/local/bin/expose-django-service <<'EOS'
 #!/usr/bin/env sh
 set -eu
@@ -316,14 +318,17 @@ for i in $(seq 1 60); do
 done
 [ -n "${PORT}" ] || { echo "… TIMEOUT (no URL printed)"; echo "=== BEGIN TUNNEL LOG ==="; cat "${URL_FILE}" || true; echo "=== END TUNNEL LOG ==="; exit 1; }
 
-# Ensure container-wide listener on 0.0.0.0:${PORT} -> 127.0.0.1:${PORT}
-if ! ss -ltn 2>/dev/null | awk '{print $4}' | grep -q ":${PORT}\$"; then
-  nohup socat TCP-LISTEN:${PORT},fork,reuseaddr,bind=0.0.0.0 TCP:127.0.0.1:${PORT} >/dev/null 2>&1 &
-fi
+# Ensure container-wide listener 0.0.0.0:${PORT} -> 127.0.0.1:${PORT}
+# (bind to all interfaces so host->container traffic is accepted)
+pkill -f "socat TCP-LISTEN:${PORT}," >/dev/null 2>&1 || true
+nohup socat TCP-LISTEN:${PORT},fork,reuseaddr,bind=0.0.0.0 TCP:127.0.0.1:${PORT} >/dev/null 2>&1 &
 
-# Jenkins container IP on docker bridge (eth0)
-JENKINS_IP="$(ip -4 addr show eth0 | awk '/inet /{print $2}' | cut -d/ -f1)"
-[ -n "${JENKINS_IP}" ] || { echo "ERROR: cannot determine Jenkins container IP"; exit 1; }
+# Jenkins container IP on docker bridge (eth0) — robust detection
+if command -v ip >/dev/null 2>&1; then
+  JENKINS_IP="$(ip -4 addr show eth0 | awk '/inet /{print $2}' | cut -d/ -f1)"
+fi
+[ -n "${JENKINS_IP:-}" ] || JENKINS_IP="$(hostname -I 2>/dev/null | awk '{print $1}')"
+[ -n "${JENKINS_IP:-}" ] || { echo "ERROR: cannot determine Jenkins container IP"; exit 1; }
 
 # Publish to Windows: prefer same port; fall back to random if busy
 NAME="expose-${SVC}-via-url"
@@ -343,8 +348,13 @@ else
   HOST_MAP="$(docker port "${NAME}" ${PORT}/tcp | tail -n1 || true)"
   HOST_PORT="$(echo "${HOST_MAP}" | awk -F':' '{print $NF}')"
 fi
-
 [ -n "${HOST_PORT}" ] || { echo "ERROR: could not determine published host port"; exit 1; }
+
+# Diagnostics (helps catch bind issues immediately)
+echo "=== DIAG ==="
+ss -ltn | grep ":${PORT}" || echo "No listener on :${PORT} inside Jenkins"
+docker port "${NAME}" ${PORT}/tcp || true
+curl -sS --max-time 2 "http://127.0.0.1:${PORT}/" | head -n 2 || echo "[inner curl failed]"
 
 echo "minikube URL (inside Jenkins): http://127.0.0.1:${PORT}"
 echo "Open on Windows: http://localhost:${HOST_PORT}"
@@ -361,6 +371,7 @@ EOS
       steps {
         sh '''
           set -euo pipefail
+          # ensure the background bridge exists (kube-apiserver convenience)
           start-ps2-bridge
           echo "Discovering a Windows-friendly URL for django-service..."
           expose-django-service default django-service || true
