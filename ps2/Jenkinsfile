@@ -2,37 +2,30 @@ pipeline {
   agent any
 
   triggers {
-    // poll every 2 minutes
     pollSCM('H/2 * * * *')
   }
 
   environment {
     NS            = 'default'
     APP           = 'mydjangoapp'
-    DEPLOY        = 'django-deployment'   // metadata.name in deployment.yaml
-    CTR           = 'django-container'    // containers[].name in deployment.yaml
-    DOCKER_CTX    = 'ps2'                 // path containing Dockerfile
-    MANIFEST_DIR  = 'ps2'                 // path containing deployment.yaml/service.yaml
+    DEPLOY        = 'django-deployment'
+    CTR           = 'django-container'
+    DOCKER_CTX    = 'ps2'
+    MANIFEST_DIR  = 'ps2'
 
-    // Persist cluster config/state OUTSIDE the workspace (survives cleanWs and restarts)
+    // Persist outside workspace
     MK_ROOT       = '/var/jenkins_home/minikube/ps2'
     MINIKUBE_HOME = "${MK_ROOT}/.minikube"
     KUBECONFIG    = "${MK_ROOT}/.kube/config"
 
-    // Dedicated Docker network for Minikube
     MK_DOCKER_NET = 'minikube-net'
     MK_SUBNET     = '10.123.0.0/16'
-
-    // Running Minikube in a container
     MINIKUBE_IN_A_CONTAINER = 'true'
   }
 
-  options {
-    timestamps()
-  }
+  options { timestamps() }
 
   stages {
-
     stage('Checkout') {
       steps {
         cleanWs()
@@ -44,7 +37,6 @@ pipeline {
       steps {
         sh '''
           set -euo pipefail
-          # Install necessary tools if they are not present
           if ! command -v minikube >/dev/null 2>&1; then
             curl -fsSL https://storage.googleapis.com/minikube/releases/latest/minikube-linux-amd64 -o /usr/local/bin/minikube
             chmod +x /usr/local/bin/minikube
@@ -57,8 +49,6 @@ pipeline {
           if ! command -v socat >/dev/null 2>&1; then
             apt-get update -y && apt-get install -y --no-install-recommends socat
           fi
-
-          # Ensure persistent dirs exist
           mkdir -p "${MINIKUBE_HOME}" "$(dirname "${KUBECONFIG}")"
         '''
       }
@@ -69,64 +59,57 @@ pipeline {
         sh '''
           set -euo pipefail
           if ! docker network inspect "${MK_DOCKER_NET}" >/dev/null 2>&1; then
-            echo "Creating Docker network: ${MK_DOCKER_NET} (${MK_SUBNET})"
             docker network create --driver=bridge --subnet="${MK_SUBNET}" "${MK_DOCKER_NET}"
           fi
         '''
       }
     }
 
-    stage('Start or Re-use Minikube (race-free bridge)') {
+    stage('Start or Re-use Minikube (race-free bridge, POSIX)') {
       steps {
         sh '''
           set -euo pipefail
-
-          # --- Ensure proxies don't hijack localhost calls (Docker Desktop may set these) ---
           export NO_PROXY="127.0.0.1,localhost,.local"
           export no_proxy="${NO_PROXY}"
           unset HTTP_PROXY HTTPS_PROXY http_proxy https_proxy || true
 
-          # --- Robust port bridge (improved parsing; runs forever in background) ---
+          # background bridge loop (POSIX)
           cat > /tmp/minikube_port_bridge.sh <<'EOSH'
-#!/usr/bin/env bash
-set -euo pipefail
-declare -A BRIDGED_PORTS
-
-parse_host_port() {
-  # docker port outputs examples:
-  # "8443/tcp -> 127.0.0.1:58138" or "8443/tcp -> 0.0.0.0:58138" or "8443/tcp -> :::58138"
-  awk -F':' '{print $NF}'
-}
-
-while true; do
-  PORT_MAPS=$(docker port minikube 2>/dev/null || true)
-  if [[ -n "$PORT_MAPS" ]]; then
-    while IFS= read -r line; do
-      [[ -z "$line" ]] && continue
-      HOST_PORT=$(echo "$line" | parse_host_port)
-      [[ "$HOST_PORT" =~ ^[0-9]+$ ]] || continue
-      if [[ -z "${BRIDGED_PORTS[$HOST_PORT]:-}" ]]; then
+#!/usr/bin/env sh
+set -eu
+# shellcheck shell=sh
+parse_host_port() { awk -F':' '{print $NF}'; }
+while :; do
+  PORT_MAPS="$(docker port minikube 2>/dev/null || true)"
+  if [ -n "${PORT_MAPS}" ]; then
+    echo "${PORT_MAPS}" | while IFS= read -r line; do
+      [ -z "${line}" ] && continue
+      HOST_PORT="$(echo "${line}" | parse_host_port)"
+      case "${HOST_PORT}" in
+        ''|*[!0-9]*) continue ;;
+        *) ;;
+      esac
+      # start a socat per port if not already listening
+      if ! ss -ltn 2>/dev/null | awk '{print $4}' | grep -q ":${HOST_PORT}\$"; then
         nohup socat TCP-LISTEN:${HOST_PORT},fork,reuseaddr TCP:host.docker.internal:${HOST_PORT} >/dev/null 2>&1 &
-        BRIDGED_PORTS[$HOST_PORT]=true
         echo "[BRIDGE] Forwarding container localhost:${HOST_PORT} -> host.docker.internal:${HOST_PORT}"
       fi
-    done <<< "$PORT_MAPS"
+    done
   fi
   sleep 1
 done
 EOSH
           chmod +x /tmp/minikube_port_bridge.sh
           nohup /tmp/minikube_port_bridge.sh >/tmp/port-bridge.log 2>&1 &
-          sleep 1  # tiny head start to avoid races
+          sleep 1
 
-          # --- Prefer reuse; start only if needed ---
-          if minikube status -p minikube | grep -q "Running"; then
+          # reuse or start
+          if minikube status -p minikube | grep -q Running; then
             echo "Reusing existing, running Minikube cluster."
             minikube -p minikube update-context
           else
-            echo "Minikube not Running — attempting idempotent start (no delete)..."
-            set +e
-            minikube start -p minikube \
+            echo "Starting Minikube…"
+            if ! minikube start -p minikube \
               --driver=docker \
               --container-runtime=containerd \
               --kubernetes-version=v1.30.0 \
@@ -134,12 +117,8 @@ EOSH
               --network="${MK_DOCKER_NET}" \
               --wait=all \
               --force \
-              -v=3 --alsologtostderr
-            rc=$?
-            set -e
-
-            if [ $rc -ne 0 ]; then
-              echo "Start failed; cluster may be corrupted. Deleting profile and retrying a clean start..."
+              -v=3 --alsologtostderr; then
+              echo "Start failed; deleting profile then retrying…"
               minikube delete -p minikube || true
               minikube start -p minikube \
                 --driver=docker \
@@ -153,39 +132,30 @@ EOSH
             fi
           fi
 
-          # --- Explicitly bridge the kube-apiserver host port and wait until reachable ---
+          # explicit apiserver bridge + wait
           API_HOST_PORT="$(docker port minikube 8443/tcp | awk -F':' '{print $NF}' | tail -n1 || true)"
-          if [[ -n "${API_HOST_PORT:-}" && "${API_HOST_PORT}" =~ ^[0-9]+$ ]]; then
-            echo "[APISERVER] Host port is ${API_HOST_PORT}"
-
-            # If not already listening locally, start a dedicated forward now
-            if ! (ss -ltn 2>/dev/null | awk '{print $4}' | grep -q ":${API_HOST_PORT}$"); then
-              nohup socat TCP-LISTEN:${API_HOST_PORT},fork,reuseaddr TCP:host.docker.internal:${API_HOST_PORT} >/dev/null 2>&1 &
-              echo "[APISERVER] Dedicated forward started on :${API_HOST_PORT}"
-            fi
-
-            # Wait until localhost:${API_HOST_PORT} is reachable to prevent "connection refused" races
-            echo -n "[APISERVER] Waiting for localhost:${API_HOST_PORT} "
-            for i in $(seq 1 90); do
-              if (exec 3<>/dev/tcp/127.0.0.1/${API_HOST_PORT}) 2>/dev/null; then
-                echo "OK"
-                break
+          case "${API_HOST_PORT}" in
+            ''|*[!0-9]*) 
+              echo "[APISERVER] Could not determine host port from 'docker port minikube 8443/tcp'"
+              docker port minikube || true
+              ;;
+            *)
+              echo "[APISERVER] Host port is ${API_HOST_PORT}"
+              if ! ss -ltn 2>/dev/null | awk '{print $4}' | grep -q ":${API_HOST_PORT}\$"; then
+                nohup socat TCP-LISTEN:${API_HOST_PORT},fork,reuseaddr TCP:host.docker.internal:${API_HOST_PORT} >/dev/null 2>&1 &
+                echo "[APISERVER] Dedicated forward started on :${API_HOST_PORT}"
               fi
-              echo -n "."
-              sleep 1
-              if [[ $i -eq 90 ]]; then
-                echo " TIMEOUT"
-                echo "[APISERVER] Bridge not reachable; recent bridge logs:"
-                tail -n 100 /tmp/port-bridge.log || true
-                exit 1
-              fi
-            done
-          else
-            echo "[APISERVER] Could not determine host port from 'docker port minikube 8443/tcp'"
-            docker port minikube || true
-          fi
+              printf "[APISERVER] Waiting for localhost:%s " "${API_HOST_PORT}"
+              i=0
+              until (exec 3<>/dev/tcp/127.0.0.1/${API_HOST_PORT}) 2>/dev/null; do
+                i=$((i+1)); [ "$i" -ge 90 ] && { echo "TIMEOUT"; tail -n 100 /tmp/port-bridge.log || true; exit 1; }
+                printf "."
+                sleep 1
+              done
+              echo "OK"
+              ;;
+          esac
 
-          # --- Final verification: now safe to use kubectl ---
           echo "Verifying cluster connectivity..."
           kubectl config current-context
           kubectl get nodes -o wide
@@ -212,9 +182,7 @@ EOSH
     }
 
     stage('Load Image into Minikube') {
-      steps {
-        sh 'minikube -p minikube image load "${IMAGE}"'
-      }
+      steps { sh 'minikube -p minikube image load "${IMAGE}"' }
     }
 
     stage('Apply Manifests & Rollout') {
@@ -230,24 +198,17 @@ EOSH
       }
     }
 
-    // Optional: quick snapshot
     stage('Pods Snapshot & Debug') {
       steps {
         sh '''
           set -euo pipefail
-          echo "== Context =="
-          kubectl config current-context || true
+          echo "== Context =="; kubectl config current-context || true
+          echo "== All namespaces =="; kubectl get pods -A -o wide || true
+          echo "== App namespace (${NS}) =="; kubectl -n ${NS} get deploy,po,svc,ep -o wide || true
 
-          echo "== All namespaces =="
-          kubectl get pods -A -o wide || true
-
-          echo "== App namespace (${NS}) =="
-          kubectl -n ${NS} get deploy,po,svc,ep -o wide || true
-
-          # Dump details for non-ready pods
-          not_ready=$(kubectl -n ${NS} get pods --no-headers | awk '$2 != "1/1" || $3 != "Running" {print $1}')
-          if [ -n "${not_ready:-}" ]; then
-            for p in $not_ready; do
+          not_ready="$(kubectl -n ${NS} get pods --no-headers | awk '$2 != "1/1" || $3 != "Running" {print $1}')"
+          if [ -n "${not_ready}" ]; then
+            for p in ${not_ready}; do
               echo "---- describe $p ----"
               kubectl -n ${NS} describe pod "$p" || true
               echo "---- logs (all containers) $p ----"
@@ -258,15 +219,14 @@ EOSH
       }
     }
 
-    // Make interactive access easy after the build
-    stage('Make Interactive Access Easy') {
+    stage('Make Interactive Access Easy (wrappers + helpers)') {
       steps {
         sh '''
           set -euo pipefail
           mkdir -p "${MINIKUBE_HOME}" "$(dirname "${KUBECONFIG}")"
 
           cat > /usr/local/bin/kube-ps2 <<'EOS'
-#!/usr/bin/env bash
+#!/usr/bin/env sh
 export MK_ROOT="/var/jenkins_home/minikube/ps2"
 export MINIKUBE_HOME="${MK_ROOT}/.minikube"
 export KUBECONFIG="${MK_ROOT}/.kube/config"
@@ -275,7 +235,7 @@ EOS
           chmod +x /usr/local/bin/kube-ps2
 
           cat > /usr/local/bin/mk-ps2 <<'EOS'
-#!/usr/bin/env bash
+#!/usr/bin/env sh
 export MK_ROOT="/var/jenkins_home/minikube/ps2"
 export MINIKUBE_HOME="${MK_ROOT}/.minikube"
 export KUBECONFIG="${MK_ROOT}/.kube/config"
@@ -283,12 +243,40 @@ exec minikube -p minikube "$@"
 EOS
           chmod +x /usr/local/bin/mk-ps2
 
-          echo "Wrappers installed: kube-ps2, mk-ps2"
+          cat > /usr/local/bin/start-ps2-bridge <<'EOS'
+#!/usr/bin/env sh
+set -eu
+# Start loop if not running
+if ! pgrep -f minikube_port_bridge.sh >/dev/null 2>&1; then
+  nohup /tmp/minikube_port_bridge.sh >/tmp/port-bridge.log 2>&1 &
+fi
+API_HOST_PORT="$(docker port minikube 8443/tcp | awk -F':' '{print $NF}' | tail -n1 || true)"
+case "${API_HOST_PORT}" in
+  ''|*[!0-9]*) echo "Could not determine API host port"; docker port minikube || true; exit 0 ;;
+  *) 
+    if ! ss -ltn 2>/dev/null | awk '{print $4}' | grep -q ":${API_HOST_PORT}\$"; then
+      nohup socat TCP-LISTEN:${API_HOST_PORT},fork,reuseaddr TCP:host.docker.internal:${API_HOST_PORT} >/dev/null 2>&1 &
+    fi
+    i=0; while ! (exec 3<>/dev/tcp/127.0.0.1/${API_HOST_PORT}) 2>/dev/null; do i=$((i+1)); [ "$i" -ge 60 ] && break; sleep 1; done
+    echo "Bridge ready on :${API_HOST_PORT}"
+    ;;
+esac
+EOS
+          chmod +x /usr/local/bin/start-ps2-bridge
+
+          cat > /usr/local/bin/stop-ps2-bridge <<'EOS'
+#!/usr/bin/env sh
+pkill -f minikube_port_bridge.sh >/dev/null 2>&1 || true
+pkill -f "socat TCP-LISTEN" >/dev/null 2>&1 || true
+echo "Bridge stopped"
+EOS
+          chmod +x /usr/local/bin/stop-ps2-bridge
+
+          echo "Installed: kube-ps2, mk-ps2, start-ps2-bridge, stop-ps2-bridge"
         '''
       }
     }
 
-    // Optional: archive a small snapshot
     stage('Archive K8s Snapshot') {
       steps {
         sh '''
@@ -305,9 +293,9 @@ EOS
 
   post {
     always {
-      echo 'Pipeline finished. Cleaning up port bridge...'
-      sh 'pkill -f minikube_port_bridge.sh || true'
-      sh 'pkill -f "socat TCP-LISTEN" || true'
+      echo 'Pipeline finished.'
+      // We intentionally do NOT kill the bridge here so you can use mk-ps2/kube-ps2 after the run.
+      // To stop it manually, exec into the container and run: stop-ps2-bridge
     }
     failure {
       echo 'Collecting Minikube & network logs for debugging…'
