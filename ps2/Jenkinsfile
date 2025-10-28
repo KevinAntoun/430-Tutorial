@@ -43,10 +43,8 @@ pipeline {
             curl -fsSL "https://dl.k8s.io/release/${KVER}/bin/linux/amd64/kubectl" -o /usr/local/bin/kubectl
             chmod +x /usr/local/bin/kubectl
           fi
-          if ! command -v socat >/dev/null 2>&1; then
-            apt-get update -y && apt-get install -y --no-install-recommends socat
-          fi
-          mkdir -p "${MINIKUBE_HOME}" "$(dirname "${KUBECONFIG}")"
+          apt-get update -y
+          apt-get install -y --no-install-recommends iproute2 socat
         '''
       }
     }
