@@ -11,8 +11,8 @@ pipeline {
     APP           = 'mydjangoapp'
     DEPLOY        = 'django-deployment'   // metadata.name in deployment.yaml
     CTR           = 'django-container'    // containers[].name in deployment.yaml
-    DOCKER_CTX    = 'ps2'                  // path containing Dockerfile
-    MANIFEST_DIR  = 'ps2'                  // path containing deployment.yaml/service.yaml
+    DOCKER_CTX    = 'ps2'                 // path containing Dockerfile
+    MANIFEST_DIR  = 'ps2'                 // path containing deployment.yaml/service.yaml
 
     // Persist cluster config/state OUTSIDE the workspace (survives cleanWs and restarts)
     MK_ROOT       = '/var/jenkins_home/minikube/ps2'
@@ -76,7 +76,7 @@ pipeline {
       }
     }
 
-    stage('Start or Re-use Minikube (with localhost bridge)') {
+    stage('Start or Re-use Minikube (no destructive delete)') {
       steps {
         sh '''
           set -euo pipefail
@@ -103,28 +103,41 @@ done
 EOSH
           chmod +x /tmp/minikube_port_bridge.sh
           nohup /tmp/minikube_port_bridge.sh >/tmp/port-bridge.log 2>&1 &
-          sleep 2 # Give the bridge a moment to start its loop
+          sleep 2
 
-          # --- Check if Minikube is already running ---
+          # --- Prefer reuse; start only if needed ---
           if minikube status -p minikube | grep -q "Running"; then
             echo "Reusing existing, running Minikube cluster."
             minikube -p minikube update-context
           else
-            echo "No running Minikube found. Starting a new cluster..."
-
-            minikube delete -p minikube || true
-            rm -rf "${MINIKUBE_HOME}/cache/preloaded-tarball"
-
+            echo "Minikube not Running — attempting idempotent start (no delete)..."
+            set +e
             minikube start -p minikube \
               --driver=docker \
               --container-runtime=containerd \
               --kubernetes-version=v1.30.0 \
               --cpus=2 --memory=4096 \
               --network="${MK_DOCKER_NET}" \
-              --delete-on-failure \
               --wait=all \
               --force \
               -v=3 --alsologtostderr
+            rc=$?
+            set -e
+
+            if [ $rc -ne 0 ]; then
+              echo "Start failed; cluster may be corrupted. Deleting profile and retrying a clean start..."
+              # Delete the profile ONCE; DO NOT wipe the preload cache
+              minikube delete -p minikube || true
+              minikube start -p minikube \
+                --driver=docker \
+                --container-runtime=containerd \
+                --kubernetes-version=v1.30.0 \
+                --cpus=2 --memory=4096 \
+                --network="${MK_DOCKER_NET}" \
+                --wait=all \
+                --force \
+                -v=3 --alsologtostderr
+            fi
           fi
 
           # Final verification to ensure the cluster is responsive
@@ -172,7 +185,7 @@ EOSH
       }
     }
 
-    // Optional: quick snapshot (kept, but you can remove if you want)
+    // Optional: quick snapshot
     stage('Pods Snapshot & Debug') {
       steps {
         sh '''
@@ -200,7 +213,7 @@ EOSH
       }
     }
 
-    // >>> New stage: install interactive wrapper scripts for later use
+    // Install interactive wrapper scripts for later use
     stage('Make Interactive Access Easy') {
       steps {
         sh '''
@@ -230,7 +243,7 @@ EOS
       }
     }
 
-    // Optional: archive a small snapshot for convenience
+    // Optional: archive a small snapshot
     stage('Archive K8s Snapshot') {
       steps {
         sh '''
