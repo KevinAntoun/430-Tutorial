@@ -277,7 +277,7 @@ echo "Bridge stopped"
 EOS
           chmod +x /usr/local/bin/stop-ps2-bridge
 
-          # expose-django-service: USES 'minikube service --url' then forwards that random port to Windows
+          # expose-django-service (IPv4-safe publish to Windows)
           cat > /usr/local/bin/expose-django-service <<'EOS'
 #!/usr/bin/env sh
 set -eu
@@ -319,7 +319,6 @@ done
 [ -n "${PORT}" ] || { echo "… TIMEOUT (no URL printed)"; echo "=== BEGIN TUNNEL LOG ==="; cat "${URL_FILE}" || true; echo "=== END TUNNEL LOG ==="; exit 1; }
 
 # Ensure container-wide listener 0.0.0.0:${PORT} -> 127.0.0.1:${PORT}
-# (bind to all interfaces so host->container traffic is accepted)
 pkill -f "socat TCP-LISTEN:${PORT}," >/dev/null 2>&1 || true
 nohup socat TCP-LISTEN:${PORT},fork,reuseaddr,bind=0.0.0.0 TCP:127.0.0.1:${PORT} >/dev/null 2>&1 &
 
@@ -330,21 +329,21 @@ fi
 [ -n "${JENKINS_IP:-}" ] || JENKINS_IP="$(hostname -I 2>/dev/null | awk '{print $1}')"
 [ -n "${JENKINS_IP:-}" ] || { echo "ERROR: cannot determine Jenkins container IP"; exit 1; }
 
-# Publish to Windows: prefer same port; fall back to random if busy
+# Publish to Windows on IPv4 loopback; prefer same port, else random host port (still IPv4-only)
 NAME="expose-${SVC}-via-url"
 docker rm -f "${NAME}" >/dev/null 2>&1 || true
 if docker run -d --name "${NAME}" --restart unless-stopped \
      --network bridge \
-     -p ${PORT}:${PORT} \
+     -p 127.0.0.1:${PORT}:${PORT} \
      alpine/socat \
-     tcp-listen:${PORT},fork,reuseaddr tcp:${JENKINS_IP}:${PORT} >/dev/null 2>&1; then
+     tcp-listen:${PORT},fork,reuseaddr,bind=0.0.0.0 tcp:${JENKINS_IP}:${PORT} >/dev/null 2>&1; then
   HOST_PORT="${PORT}"
 else
   docker run -d --name "${NAME}" --restart unless-stopped \
     --network bridge \
-    -p :${PORT} \
+    -p 127.0.0.1::${PORT} \
     alpine/socat \
-    tcp-listen:${PORT},fork,reuseaddr tcp:${JENKINS_IP}:${PORT} >/dev/null
+    tcp-listen:${PORT},fork,reuseaddr,bind=0.0.0.0 tcp:${JENKINS_IP}:${PORT} >/dev/null
   HOST_MAP="$(docker port "${NAME}" ${PORT}/tcp | tail -n1 || true)"
   HOST_PORT="$(echo "${HOST_MAP}" | awk -F':' '{print $NF}')"
 fi
@@ -357,7 +356,8 @@ docker port "${NAME}" ${PORT}/tcp || true
 curl -sS --max-time 2 "http://127.0.0.1:${PORT}/" | head -n 2 || echo "[inner curl failed]"
 
 echo "minikube URL (inside Jenkins): http://127.0.0.1:${PORT}"
-echo "Open on Windows: http://localhost:${HOST_PORT}"
+# IMPORTANT: print IPv4 loopback to avoid Windows 'localhost' => ::1
+echo "Open on Windows: http://127.0.0.1:${HOST_PORT}"
 EOS
           chmod +x /usr/local/bin/expose-django-service
 
