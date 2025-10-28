@@ -267,52 +267,32 @@ echo "Bridge stopped"
 EOS
           chmod +x /usr/local/bin/stop-ps2-bridge
 
-          # --- NEW: expose-django-service helper ---
+          # --- Host-published forwarder: exposes NodePort to Windows localhost ---
           cat > /usr/local/bin/expose-django-service <<'EOS'
 #!/usr/bin/env sh
 set -eu
 NS="${1:-default}"
 SVC="${2:-django-service}"
 
-if ! command -v socat >/dev/null 2>&1; then
-  echo "socat not found; installing..."
-  apt-get update -y >/dev/null 2>&1 && apt-get install -y --no-install-recommends socat >/dev/null 2>&1
-fi
-
-# Try NodePort first (preferred)
+# Discover NodePort
 NODEPORT="$(kubectl -n "${NS}" get svc "${SVC}" -o jsonpath='{.spec.ports[0].nodePort}' 2>/dev/null || true)"
-case "${NODEPORT}" in ''|*[!0-9]*) NODEPORT="";; esac
+case "${NODEPORT}" in ''|*[!0-9]*) echo "ERROR: cannot detect NodePort for ${NS}/${SVC}"; exit 1;; esac
 
-if [ -n "${NODEPORT}" ]; then
-  PORT="${NODEPORT}"
-  if ! ss -ltn 2>/dev/null | awk '{print $4}' | grep -q ":${PORT}\$"; then
-    nohup socat TCP-LISTEN:${PORT},fork,reuseaddr TCP:host.docker.internal:${PORT} >/dev/null 2>&1 &
-  fi
-  echo "✔ NodePort detected: ${PORT}"
-  echo "Open on Windows: http://localhost:${PORT}"
-  exit 0
-fi
+# Minikube node IP (on minikube-net)
+NODE_IP="$(mk-ps2 ip 2>/dev/null || true)"
+[ -z "${NODE_IP}" ] && NODE_IP="10.123.0.2"  # fallback for your configured subnet
 
-# Fallback: minikube service --url
-URL_FILE="/tmp/${SVC}-url.txt"
-nohup sh -c "mk-ps2 service -n '${NS}' '${SVC}' --url | tee '${URL_FILE}' >/dev/null" >/dev/null 2>&1 &
-for i in $(seq 1 10); do
-  sleep 1
-  [ -s "${URL_FILE}" ] && break
-done
-if [ ! -s "${URL_FILE}" ]; then
-  echo "ERROR: couldn't obtain service URL for ${NS}/${SVC}"
-  exit 1
-fi
-URL="$(head -n1 "${URL_FILE}" | tr -d '\\r\\n')"
-PORT="$(echo "${URL}" | sed -n 's#.*:\\([0-9][0-9]*\\).*#\\1#p')"
-case "${PORT}" in ''|*[!0-9]*) echo "ERROR: couldn't parse port from URL: ${URL}"; exit 1;; esac
+echo "Exposing ${NS}/${SVC}: Windows http://localhost:${NODEPORT}  ->  ${NODE_IP}:${NODEPORT}"
 
-if ! ss -ltn 2>/dev/null | awk '{print $4}' | grep -q ":${PORT}\$"; then
-  nohup socat TCP-LISTEN:${PORT},fork,reuseaddr TCP:host.docker.internal:${PORT} >/dev/null 2>&1 &
-fi
-echo "✔ Tunnel URL (inside container): ${URL}"
-echo "Open on Windows: http://localhost:${PORT}"
+# Recreate forwarder container (publishes on host via -p)
+docker rm -f "expose-${SVC}" >/dev/null 2>&1 || true
+docker run -d --name "expose-${SVC}" --restart unless-stopped \
+  --network minikube-net \
+  -p ${NODEPORT}:${NODEPORT} \
+  alpine/socat \
+  tcp-listen:${NODEPORT},fork,reuseaddr tcp:${NODE_IP}:${NODEPORT} >/dev/null
+
+echo "Open on Windows: http://localhost:${NODEPORT}"
 EOS
           chmod +x /usr/local/bin/expose-django-service
 
