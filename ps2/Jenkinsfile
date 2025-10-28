@@ -10,13 +10,14 @@ pipeline {
     NS            = 'default'
     APP           = 'mydjangoapp'
     DEPLOY        = 'django-deployment'   // metadata.name in deployment.yaml
-    CTR           = 'django-container'                 // containers[].name in deployment.yaml
-    DOCKER_CTX    = 'ps2'                 // path containing Dockerfile
-    MANIFEST_DIR  = 'ps2'                 // path containing deployment.yaml/service.yaml
+    CTR           = 'django-container'    // containers[].name in deployment.yaml
+    DOCKER_CTX    = 'ps2'                  // path containing Dockerfile
+    MANIFEST_DIR  = 'ps2'                  // path containing deployment.yaml/service.yaml
 
-    // Persist cluster config/state across stages in this workspace
-    MINIKUBE_HOME = "${WORKSPACE}/.minikube"
-    KUBECONFIG    = "${WORKSPACE}/.kube/config"
+    // Persist cluster config/state OUTSIDE the workspace (survives cleanWs and restarts)
+    MK_ROOT       = '/var/jenkins_home/minikube/ps2'
+    MINIKUBE_HOME = "${MK_ROOT}/.minikube"
+    KUBECONFIG    = "${MK_ROOT}/.kube/config"
 
     // Dedicated Docker network for Minikube
     MK_DOCKER_NET = 'minikube-net'
@@ -44,9 +45,20 @@ pipeline {
         sh '''
           set -euo pipefail
           # Install necessary tools if they are not present
-          if ! command -v minikube >/dev/null 2>&1; then curl -fsSL https://storage.googleapis.com/minikube/releases/latest/minikube-linux-amd64 -o /usr/local/bin/minikube && chmod +x /usr/local/bin/minikube; fi
-          if ! command -v kubectl >/dev/null 2>&1; then KVER="$(curl -fsSL https://dl.k8s.io/release/stable.txt)"; curl -fsSL "https://dl.k8s.io/release/${KVER}/bin/linux/amd64/kubectl" -o /usr/local/bin/kubectl && chmod +x /usr/local/bin/kubectl; fi
-          if ! command -v socat >/dev/null 2>&1; then apt-get update -y && apt-get install -y --no-install-recommends socat; fi
+          if ! command -v minikube >/dev/null 2>&1; then
+            curl -fsSL https://storage.googleapis.com/minikube/releases/latest/minikube-linux-amd64 -o /usr/local/bin/minikube
+            chmod +x /usr/local/bin/minikube
+          fi
+          if ! command -v kubectl >/dev/null 2>&1; then
+            KVER="$(curl -fsSL https://dl.k8s.io/release/stable.txt)"
+            curl -fsSL "https://dl.k8s.io/release/${KVER}/bin/linux/amd64/kubectl" -o /usr/local/bin/kubectl
+            chmod +x /usr/local/bin/kubectl
+          fi
+          if ! command -v socat >/dev/null 2>&1; then
+            apt-get update -y && apt-get install -y --no-install-recommends socat
+          fi
+
+          # Ensure persistent dirs exist
           mkdir -p "${MINIKUBE_HOME}" "$(dirname "${KUBECONFIG}")"
         '''
       }
@@ -99,19 +111,19 @@ EOSH
             minikube -p minikube update-context
           else
             echo "No running Minikube found. Starting a new cluster..."
-            
+
             minikube delete -p minikube || true
             rm -rf "${MINIKUBE_HOME}/cache/preloaded-tarball"
 
-            minikube start -p minikube \\
-              --driver=docker \\
-              --container-runtime=containerd \\
-              --kubernetes-version=v1.30.0 \\
-              --cpus=2 --memory=4096 \\
-              --network="${MK_DOCKER_NET}" \\
-              --delete-on-failure \\
-              --wait=all \\
-              --force \\
+            minikube start -p minikube \
+              --driver=docker \
+              --container-runtime=containerd \
+              --kubernetes-version=v1.30.0 \
+              --cpus=2 --memory=4096 \
+              --network="${MK_DOCKER_NET}" \
+              --delete-on-failure \
+              --wait=all \
+              --force \
               -v=3 --alsologtostderr
           fi
 
@@ -157,6 +169,78 @@ EOSH
           kubectl -n ${NS} rollout status deploy/${DEPLOY} --timeout=180s
           kubectl -n ${NS} get deploy,pods,svc -o wide
         """
+      }
+    }
+
+    // Optional: quick snapshot (kept, but you can remove if you want)
+    stage('Pods Snapshot & Debug') {
+      steps {
+        sh '''
+          set -euo pipefail
+          echo "== Context =="
+          kubectl config current-context || true
+
+          echo "== All namespaces =="
+          kubectl get pods -A -o wide || true
+
+          echo "== App namespace (${NS}) =="
+          kubectl -n ${NS} get deploy,po,svc,ep -o wide || true
+
+          # Dump details for non-ready pods
+          not_ready=$(kubectl -n ${NS} get pods --no-headers | awk '$2 != "1/1" || $3 != "Running" {print $1}')
+          if [ -n "${not_ready:-}" ]; then
+            for p in $not_ready; do
+              echo "---- describe $p ----"
+              kubectl -n ${NS} describe pod "$p" || true
+              echo "---- logs (all containers) $p ----"
+              kubectl -n ${NS} logs --all-containers=true --prefix "$p" || true
+            done
+          fi
+        '''
+      }
+    }
+
+    // >>> New stage: install interactive wrapper scripts for later use
+    stage('Make Interactive Access Easy') {
+      steps {
+        sh '''
+          set -euo pipefail
+          mkdir -p "${MINIKUBE_HOME}" "$(dirname "${KUBECONFIG}")"
+
+          cat > /usr/local/bin/kube-ps2 <<'EOS'
+#!/usr/bin/env bash
+export MK_ROOT="/var/jenkins_home/minikube/ps2"
+export MINIKUBE_HOME="${MK_ROOT}/.minikube"
+export KUBECONFIG="${MK_ROOT}/.kube/config"
+exec kubectl "$@"
+EOS
+          chmod +x /usr/local/bin/kube-ps2
+
+          cat > /usr/local/bin/mk-ps2 <<'EOS'
+#!/usr/bin/env bash
+export MK_ROOT="/var/jenkins_home/minikube/ps2"
+export MINIKUBE_HOME="${MK_ROOT}/.minikube"
+export KUBECONFIG="${MK_ROOT}/.kube/config"
+exec minikube -p minikube "$@"
+EOS
+          chmod +x /usr/local/bin/mk-ps2
+
+          echo "Wrappers installed: kube-ps2, mk-ps2"
+        '''
+      }
+    }
+
+    // Optional: archive a small snapshot for convenience
+    stage('Archive K8s Snapshot') {
+      steps {
+        sh '''
+          set -euo pipefail
+          mkdir -p k8s-dump
+          kubectl config view --minify > k8s-dump/kubeconfig-view.txt || true
+          kubectl -n ${NS} get deploy,po,rs,svc,ep -o wide > k8s-dump/resources.txt || true
+          kubectl -n ${NS} get events --sort-by=.lastTimestamp > k8s-dump/events.txt || true
+        '''
+        archiveArtifacts artifacts: 'k8s-dump/**', allowEmptyArchive: true
       }
     }
   }
