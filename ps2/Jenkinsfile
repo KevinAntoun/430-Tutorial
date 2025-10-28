@@ -355,7 +355,9 @@ if [ -n "${PORT}" ]; then
   sleep 0.5
 
   # Publish to Windows (prefer same port)
-  HOST_PORT="$(publish_and_verify "${PORT}" "$(hostname -I | awk '{print $1}')" "${PORT}" "expose-${SVC}-via-url" || true)"
+  # Connect back to Jenkins via Windows host gateway
+  HOST_PORT="$(publish_and_verify "" "host.docker.internal" "${PORT}" "expose-${SVC}-via-url" || true)"
+
   if [ -n "${HOST_PORT}" ] && docker ps --format '{{.Names}}' | grep -q "^expose-${SVC}-via-url$"; then
     echo "=== DIAG (Method A) ==="
     ss -ltn | grep ":${PORT}" || echo "No listener on :${PORT} inside Jenkins"
