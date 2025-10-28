@@ -141,7 +141,6 @@ EOSH
 
               printf "[APISERVER] Waiting for localhost:%s " "${API_HOST_PORT}"
               i=0
-              # Try to open a TCP connection using socat (1s timeout); exit code 0 == success
               while ! socat - TCP:127.0.0.1:${API_HOST_PORT},connect-timeout=1 </dev/null >/dev/null 2>&1; do
                 i=$((i+1)); [ "${i}" -ge 90 ] && { echo "TIMEOUT"; tail -n 100 /tmp/port-bridge.log || true; exit 1; }
                 printf "."
@@ -268,7 +267,67 @@ echo "Bridge stopped"
 EOS
           chmod +x /usr/local/bin/stop-ps2-bridge
 
-          echo "Installed: kube-ps2, mk-ps2, start-ps2-bridge, stop-ps2-bridge"
+          # --- NEW: expose-django-service helper ---
+          cat > /usr/local/bin/expose-django-service <<'EOS'
+#!/usr/bin/env sh
+set -eu
+NS="${1:-default}"
+SVC="${2:-django-service}"
+
+if ! command -v socat >/dev/null 2>&1; then
+  echo "socat not found; installing..."
+  apt-get update -y >/dev/null 2>&1 && apt-get install -y --no-install-recommends socat >/dev/null 2>&1
+fi
+
+# Try NodePort first (preferred)
+NODEPORT="$(kubectl -n "${NS}" get svc "${SVC}" -o jsonpath='{.spec.ports[0].nodePort}' 2>/dev/null || true)"
+case "${NODEPORT}" in ''|*[!0-9]*) NODEPORT="";; esac
+
+if [ -n "${NODEPORT}" ]; then
+  PORT="${NODEPORT}"
+  if ! ss -ltn 2>/dev/null | awk '{print $4}' | grep -q ":${PORT}\$"; then
+    nohup socat TCP-LISTEN:${PORT},fork,reuseaddr TCP:host.docker.internal:${PORT} >/dev/null 2>&1 &
+  fi
+  echo "✔ NodePort detected: ${PORT}"
+  echo "Open on Windows: http://localhost:${PORT}"
+  exit 0
+fi
+
+# Fallback: minikube service --url
+URL_FILE="/tmp/${SVC}-url.txt"
+nohup sh -c "mk-ps2 service -n '${NS}' '${SVC}' --url | tee '${URL_FILE}' >/dev/null" >/dev/null 2>&1 &
+for i in $(seq 1 10); do
+  sleep 1
+  [ -s "${URL_FILE}" ] && break
+done
+if [ ! -s "${URL_FILE}" ]; then
+  echo "ERROR: couldn't obtain service URL for ${NS}/${SVC}"
+  exit 1
+fi
+URL="$(head -n1 "${URL_FILE}" | tr -d '\\r\\n')"
+PORT="$(echo "${URL}" | sed -n 's#.*:\\([0-9][0-9]*\\).*#\\1#p')"
+case "${PORT}" in ''|*[!0-9]*) echo "ERROR: couldn't parse port from URL: ${URL}"; exit 1;; esac
+
+if ! ss -ltn 2>/dev/null | awk '{print $4}' | grep -q ":${PORT}\$"; then
+  nohup socat TCP-LISTEN:${PORT},fork,reuseaddr TCP:host.docker.internal:${PORT} >/dev/null 2>&1 &
+fi
+echo "✔ Tunnel URL (inside container): ${URL}"
+echo "Open on Windows: http://localhost:${PORT}"
+EOS
+          chmod +x /usr/local/bin/expose-django-service
+
+          echo "Installed: kube-ps2, mk-ps2, start-ps2-bridge, stop-ps2-bridge, expose-django-service"
+        '''
+      }
+    }
+
+    // Optional: print the Windows-friendly URL in the build log
+    stage('Expose Django URL (print for Windows)') {
+      steps {
+        sh '''
+          set -euo pipefail
+          echo "Discovering a Windows-friendly URL for django-service..."
+          expose-django-service default django-service || true
         '''
       }
     }
