@@ -124,7 +124,7 @@ EOSH
             fi
           fi
 
-          # --- explicit apiserver bridge + POSIX wait using socat as probe ---
+          # --- explicit apiserver bridge + wait using socat as probe ---
           API_HOST_PORT="$(docker port minikube 8443/tcp | awk -F':' '{print $NF}' | tail -n1 || true)"
           case "${API_HOST_PORT}" in
             ''|*[!0-9]*) 
@@ -160,7 +160,7 @@ EOSH
       steps {
         script {
           env.TAG   = sh(returnStdout: true, script: 'git rev-parse --short HEAD').trim()
-          env.IMAGE = "${env.APP}:${env.TAG}"]
+          env.IMAGE = "${env.APP}:${env.TAG}"   // <-- fixed: removed stray ']'
           echo "IMAGE=${env.IMAGE}"
         }
       }
@@ -225,7 +225,6 @@ EOSH
 export MK_ROOT="/var/jenkins_home/minikube/ps2"
 export MINIKUBE_HOME="${MK_ROOT}/.minikube"
 export KUBECONFIG="${MK_ROOT}/.kube/config"
-# harden against proxies
 unset HTTP_PROXY HTTPS_PROXY http_proxy https_proxy
 export NO_PROXY='127.0.0.1,localhost,.local,.svc,cluster.local,10.96.0.0/12,10.244.0.0/16,10.123.0.0/16'
 export no_proxy="${NO_PROXY}"
@@ -285,7 +284,7 @@ set -eu
 NS="${1:-default}"
 SVC="${2:-django-service}"
 
-# Kill proxies so kubectl doesn't hit Jenkins' login
+# Kill proxies so kubectl doesn't hit Jenkins login
 unset HTTP_PROXY HTTPS_PROXY http_proxy https_proxy
 export NO_PROXY='127.0.0.1,localhost,.local,.svc,cluster.local,10.96.0.0/12,10.244.0.0/16,10.123.0.0/16'
 export no_proxy="${NO_PROXY}"
@@ -348,7 +347,6 @@ EOS
       steps {
         sh '''
           set -euo pipefail
-          # make sure the API bridge is alive before exposing the service
           start-ps2-bridge
           echo "Discovering a Windows-friendly URL for django-service..."
           expose-django-service default django-service || true
