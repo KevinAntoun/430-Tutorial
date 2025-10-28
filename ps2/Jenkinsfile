@@ -82,7 +82,6 @@ while :; do
       [ -z "${line}" ] && continue
       HOST_PORT="$(echo "${line}" | parse_host_port)"
       case "${HOST_PORT}" in ''|*[!0-9]*) continue;; esac
-      # start a socat per port if not already listening
       if ! ss -ltn 2>/dev/null | awk '{print $4}' | grep -q ":${HOST_PORT}\$"; then
         nohup socat TCP-LISTEN:${HOST_PORT},fork,reuseaddr TCP:host.docker.internal:${HOST_PORT} >/dev/null 2>&1 &
         echo "[BRIDGE] Forwarding container localhost:${HOST_PORT} -> host.docker.internal:${HOST_PORT}"
@@ -267,32 +266,43 @@ echo "Bridge stopped"
 EOS
           chmod +x /usr/local/bin/stop-ps2-bridge
 
-          # --- Host-published forwarder: exposes NodePort to Windows localhost ---
+          # --- Host-published forwarder helper (NodePort preferred, tunnel fallback) ---
           cat > /usr/local/bin/expose-django-service <<'EOS'
 #!/usr/bin/env sh
 set -eu
 NS="${1:-default}"
 SVC="${2:-django-service}"
 
-# Discover NodePort
+# Try NodePort first
 NODEPORT="$(kubectl -n "${NS}" get svc "${SVC}" -o jsonpath='{.spec.ports[0].nodePort}' 2>/dev/null || true)"
-case "${NODEPORT}" in ''|*[!0-9]*) echo "ERROR: cannot detect NodePort for ${NS}/${SVC}"; exit 1;; esac
+case "${NODEPORT}" in ''|*[!0-9]*) NODEPORT="";; esac
 
-# Minikube node IP (on minikube-net)
-NODE_IP="$(mk-ps2 ip 2>/dev/null || true)"
-[ -z "${NODE_IP}" ] && NODE_IP="10.123.0.2"  # fallback for your configured subnet
+if [ -n "${NODEPORT}" ]; then
+  NODE_IP="$(mk-ps2 ip 2>/dev/null || true)"; [ -z "${NODE_IP}" ] && NODE_IP="10.123.0.2"
+  docker rm -f "expose-${SVC}" >/dev/null 2>&1 || true
+  docker run -d --name "expose-${SVC}" --restart unless-stopped \
+    --network minikube-net \
+    -p ${NODEPORT}:${NODEPORT} \
+    alpine/socat \
+    tcp-listen:${NODEPORT},fork,reuseaddr tcp:${NODE_IP}:${NODEPORT} >/dev/null
+  echo "Open on Windows: http://localhost:${NODEPORT}"
+  exit 0
+fi
 
-echo "Exposing ${NS}/${SVC}: Windows http://localhost:${NODEPORT}  ->  ${NODE_IP}:${NODEPORT}"
+# Fallback: minikube service --url (tunnel), then publish that port on Windows host
+URL="$(mk-ps2 service -n "${NS}" "${SVC}" --url)"
+PORT="$(echo "${URL}" | sed -n 's#.*:\\([0-9][0-9]*\\).*#\\1#p')"
+[ -z "${PORT}" ] && { echo "ERROR: couldn't parse port from URL: ${URL}"; exit 1; }
 
-# Recreate forwarder container (publishes on host via -p)
 docker rm -f "expose-${SVC}" >/dev/null 2>&1 || true
 docker run -d --name "expose-${SVC}" --restart unless-stopped \
   --network minikube-net \
-  -p ${NODEPORT}:${NODEPORT} \
+  -p ${PORT}:${PORT} \
   alpine/socat \
-  tcp-listen:${NODEPORT},fork,reuseaddr tcp:${NODE_IP}:${NODEPORT} >/dev/null
+  tcp-listen:${PORT},fork,reuseaddr tcp:host.docker.internal:${PORT} >/dev/null
 
-echo "Open on Windows: http://localhost:${NODEPORT}"
+echo "✔ Tunnel URL (inside Jenkins): ${URL}"
+echo "Open on Windows: http://localhost:${PORT}"
 EOS
           chmod +x /usr/local/bin/expose-django-service
 
@@ -329,7 +339,7 @@ EOS
   post {
     always {
       echo 'Pipeline finished.'
-      // We keep the bridge running so you can use mk-ps2/kube-ps2 after the run.
+      // Keep the bridge running so you can use mk-ps2/kube-ps2 afterwards.
       // When done manually: stop-ps2-bridge
     }
     failure {
