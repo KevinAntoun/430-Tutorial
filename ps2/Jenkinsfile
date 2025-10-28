@@ -1,9 +1,7 @@
 pipeline {
   agent any
 
-  triggers {
-    pollSCM('H/2 * * * *')
-  }
+  triggers { pollSCM('H/2 * * * *') }
 
   environment {
     NS            = 'default'
@@ -13,7 +11,6 @@ pipeline {
     DOCKER_CTX    = 'ps2'
     MANIFEST_DIR  = 'ps2'
 
-    // Persist outside workspace
     MK_ROOT       = '/var/jenkins_home/minikube/ps2'
     MINIKUBE_HOME = "${MK_ROOT}/.minikube"
     KUBECONFIG    = "${MK_ROOT}/.kube/config"
@@ -73,11 +70,10 @@ pipeline {
           export no_proxy="${NO_PROXY}"
           unset HTTP_PROXY HTTPS_PROXY http_proxy https_proxy || true
 
-          # background bridge loop (POSIX)
+          # --- background bridge loop (POSIX) ---
           cat > /tmp/minikube_port_bridge.sh <<'EOSH'
 #!/usr/bin/env sh
 set -eu
-# shellcheck shell=sh
 parse_host_port() { awk -F':' '{print $NF}'; }
 while :; do
   PORT_MAPS="$(docker port minikube 2>/dev/null || true)"
@@ -85,10 +81,7 @@ while :; do
     echo "${PORT_MAPS}" | while IFS= read -r line; do
       [ -z "${line}" ] && continue
       HOST_PORT="$(echo "${line}" | parse_host_port)"
-      case "${HOST_PORT}" in
-        ''|*[!0-9]*) continue ;;
-        *) ;;
-      esac
+      case "${HOST_PORT}" in ''|*[!0-9]*) continue;; esac
       # start a socat per port if not already listening
       if ! ss -ltn 2>/dev/null | awk '{print $4}' | grep -q ":${HOST_PORT}\$"; then
         nohup socat TCP-LISTEN:${HOST_PORT},fork,reuseaddr TCP:host.docker.internal:${HOST_PORT} >/dev/null 2>&1 &
@@ -103,7 +96,7 @@ EOSH
           nohup /tmp/minikube_port_bridge.sh >/tmp/port-bridge.log 2>&1 &
           sleep 1
 
-          # reuse or start
+          # --- reuse or start cluster ---
           if minikube status -p minikube | grep -q Running; then
             echo "Reusing existing, running Minikube cluster."
             minikube -p minikube update-context
@@ -132,7 +125,7 @@ EOSH
             fi
           fi
 
-          # explicit apiserver bridge + wait
+          # --- explicit apiserver bridge + POSIX wait using socat as probe ---
           API_HOST_PORT="$(docker port minikube 8443/tcp | awk -F':' '{print $NF}' | tail -n1 || true)"
           case "${API_HOST_PORT}" in
             ''|*[!0-9]*) 
@@ -145,10 +138,12 @@ EOSH
                 nohup socat TCP-LISTEN:${API_HOST_PORT},fork,reuseaddr TCP:host.docker.internal:${API_HOST_PORT} >/dev/null 2>&1 &
                 echo "[APISERVER] Dedicated forward started on :${API_HOST_PORT}"
               fi
+
               printf "[APISERVER] Waiting for localhost:%s " "${API_HOST_PORT}"
               i=0
-              until (exec 3<>/dev/tcp/127.0.0.1/${API_HOST_PORT}) 2>/dev/null; do
-                i=$((i+1)); [ "$i" -ge 90 ] && { echo "TIMEOUT"; tail -n 100 /tmp/port-bridge.log || true; exit 1; }
+              # Try to open a TCP connection using socat (1s timeout); exit code 0 == success
+              while ! socat - TCP:127.0.0.1:${API_HOST_PORT},connect-timeout=1 </dev/null >/dev/null 2>&1; do
+                i=$((i+1)); [ "${i}" -ge 90 ] && { echo "TIMEOUT"; tail -n 100 /tmp/port-bridge.log || true; exit 1; }
                 printf "."
                 sleep 1
               done
@@ -246,18 +241,19 @@ EOS
           cat > /usr/local/bin/start-ps2-bridge <<'EOS'
 #!/usr/bin/env sh
 set -eu
-# Start loop if not running
 if ! pgrep -f minikube_port_bridge.sh >/dev/null 2>&1; then
   nohup /tmp/minikube_port_bridge.sh >/tmp/port-bridge.log 2>&1 &
 fi
 API_HOST_PORT="$(docker port minikube 8443/tcp | awk -F':' '{print $NF}' | tail -n1 || true)"
 case "${API_HOST_PORT}" in
   ''|*[!0-9]*) echo "Could not determine API host port"; docker port minikube || true; exit 0 ;;
-  *) 
+  *)
     if ! ss -ltn 2>/dev/null | awk '{print $4}' | grep -q ":${API_HOST_PORT}\$"; then
       nohup socat TCP-LISTEN:${API_HOST_PORT},fork,reuseaddr TCP:host.docker.internal:${API_HOST_PORT} >/dev/null 2>&1 &
     fi
-    i=0; while ! (exec 3<>/dev/tcp/127.0.0.1/${API_HOST_PORT}) 2>/dev/null; do i=$((i+1)); [ "$i" -ge 60 ] && break; sleep 1; done
+    i=0; while ! socat - TCP:127.0.0.1:${API_HOST_PORT},connect-timeout=1 </dev/null >/dev/null 2>&1; do
+      i=$((i+1)); [ "$i" -ge 60 ] && break; sleep 1
+    done
     echo "Bridge ready on :${API_HOST_PORT}"
     ;;
 esac
@@ -294,8 +290,8 @@ EOS
   post {
     always {
       echo 'Pipeline finished.'
-      // We intentionally do NOT kill the bridge here so you can use mk-ps2/kube-ps2 after the run.
-      // To stop it manually, exec into the container and run: stop-ps2-bridge
+      // We keep the bridge running so you can use mk-ps2/kube-ps2 after the run.
+      // When done manually: stop-ps2-bridge
     }
     failure {
       echo 'Collecting Minikube & network logs for debugging…'
