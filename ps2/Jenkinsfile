@@ -160,7 +160,7 @@ EOSH
       steps {
         script {
           env.TAG   = sh(returnStdout: true, script: 'git rev-parse --short HEAD').trim()
-          env.IMAGE = "${env.APP}:${env.TAG}"   // <-- fixed: removed stray ']'
+          env.IMAGE = "${env.APP}:${env.TAG}"
           echo "IMAGE=${env.IMAGE}"
         }
       }
@@ -277,63 +277,79 @@ echo "Bridge stopped"
 EOS
           chmod +x /usr/local/bin/stop-ps2-bridge
 
-          # expose-django-service (NodePort-only, proxy-safe, waits for endpoints)
+          # expose-django-service: use "minikube service --url", then publish that random port to Windows
           cat > /usr/local/bin/expose-django-service <<'EOS'
 #!/usr/bin/env sh
 set -eu
 NS="${1:-default}"
 SVC="${2:-django-service}"
 
-# Kill proxies so kubectl doesn't hit Jenkins login
+# Neutralize proxies so kubectl/minikube don't hit Jenkins login
 unset HTTP_PROXY HTTPS_PROXY http_proxy https_proxy
 export NO_PROXY='127.0.0.1,localhost,.local,.svc,cluster.local,10.96.0.0/12,10.244.0.0/16,10.123.0.0/16'
 export no_proxy="${NO_PROXY}"
 
-# Ensure service exists
+# Validate service exists
 if ! kube-ps2 -n "${NS}" get svc "${SVC}" >/dev/null 2>&1; then
   echo "ERROR: Service ${NS}/${SVC} does not exist."
   exit 1
 fi
 
-# Ensure NodePort type
-TYPE="$(kube-ps2 -n "${NS}" get svc "${SVC}" -o jsonpath='{.spec.type}')"
-if [ "${TYPE}" != "NodePort" ]; then
-  echo "Patching ${NS}/${SVC} to NodePort…"
-  kube-ps2 -n "${NS}" patch svc "${SVC}" -p '{"spec":{"type":"NodePort"}}' >/dev/null
-fi
+# Kill any old tunnel processes for this service
+pkill -f "minikube.*service.*${SVC}.*--url" >/dev/null 2>&1 || true
 
-# Wait for endpoints (up to 60s)
-echo -n "Waiting for ${NS}/${SVC} endpoints"
-i=0
-while :; do
-  EP="$(kube-ps2 -n "${NS}" get ep "${SVC}" -o jsonpath='{.subsets[0].addresses[0].ip}' 2>/dev/null || true)"
-  if [ -n "${EP}" ]; then echo " … OK (${EP})"; break; fi
-  i=$((i+1)); [ "${i}" -ge 60 ] && { echo " … TIMEOUT"; kube-ps2 -n "${NS}" get ep "${SVC}" -o wide || true; exit 1; }
-  echo -n "."
+# Start minikube's ephemeral URL tunnel in background, capture output
+URL_FILE="/tmp/${SVC}.url"
+: > "${URL_FILE}"
+nohup mk-ps2 service -n "${NS}" "${SVC}" --url > "${URL_FILE}" 2>&1 &
+
+# Wait for a URL like http://127.0.0.1:<RANDOM>
+printf "Starting minikube service --url for %s/%s " "${NS}" "${SVC}"
+PORT=""
+for i in $(seq 1 60); do
+  URL_LINE="$(grep -Eo 'http://127\\.0\\.0\\.1:[0-9]+' "${URL_FILE}" | head -n1 || true)"
+  if [ -n "${URL_LINE}" ]; then
+    PORT="$(echo "${URL_LINE}" | awk -F: '{print $3}')"
+    echo "… OK (${URL_LINE})"
+    break
+  fi
+  printf "."
   sleep 1
 done
+[ -n "${PORT}" ] || { echo "… TIMEOUT (no URL printed)"; echo "=== BEGIN TUNNEL LOG ==="; cat "${URL_FILE}" || true; echo "=== END TUNNEL LOG ==="; exit 1; }
 
-# Get NodePort
-NODEPORT="$(kube-ps2 -n "${NS}" get svc "${SVC}" -o jsonpath='{.spec.ports[0].nodePort}' 2>/dev/null || true)"
-case "${NODEPORT}" in ''|*[!0-9]*) echo "ERROR: cannot detect NodePort for ${NS}/${SVC}"; kube-ps2 -n "${NS}" get svc "${SVC}" -o wide; exit 1;; esac
+# Ensure container-wide listener on 0.0.0.0:${PORT} -> 127.0.0.1:${PORT}
+if ! ss -ltn 2>/dev/null | awk '{print $4}' | grep -q ":${PORT}\$"; then
+  nohup socat TCP-LISTEN:${PORT},fork,reuseaddr TCP:127.0.0.1:${PORT} >/dev/null 2>&1 &
+fi
 
-# Determine Minikube IP
-NODE_IP="$(mk-ps2 ip 2>/dev/null || true)"
-[ -z "${NODE_IP}" ] && NODE_IP="10.123.0.2"
+# Jenkins container IP on docker bridge (eth0)
+JENKINS_IP="$(ip -4 addr show eth0 | awk '/inet /{print $2}' | cut -d/ -f1)"
+[ -n "${JENKINS_IP}" ] || { echo "ERROR: cannot determine Jenkins container IP"; exit 1; }
 
-echo "Exposing ${NS}/${SVC}:"
-echo "  Minikube node IP: ${NODE_IP}"
-echo "  NodePort: ${NODEPORT}"
-echo "  → Windows URL: http://localhost:${NODEPORT}"
+# Publish to Windows: prefer same port; fall back to random if busy
+NAME="expose-${SVC}-via-url"
+docker rm -f "${NAME}" >/dev/null 2>&1 || true
+if docker run -d --name "${NAME}" --restart unless-stopped \
+     --network bridge \
+     -p ${PORT}:${PORT} \
+     alpine/socat \
+     tcp-listen:${PORT},fork,reuseaddr tcp:${JENKINS_IP}:${PORT} >/dev/null 2>&1; then
+  HOST_PORT="${PORT}"
+else
+  docker run -d --name "${NAME}" --restart unless-stopped \
+    --network bridge \
+    -p :${PORT} \
+    alpine/socat \
+    tcp-listen:${PORT},fork,reuseaddr tcp:${JENKINS_IP}:${PORT} >/dev/null
+  HOST_MAP="$(docker port "${NAME}" ${PORT}/tcp | tail -n1 || true)"
+  HOST_PORT="$(echo "${HOST_MAP}" | awk -F':' '{print $NF}')"
+fi
 
-docker rm -f "expose-${SVC}" >/dev/null 2>&1 || true
-docker run -d --name "expose-${SVC}" --restart unless-stopped \
-  --network minikube-net \
-  -p ${NODEPORT}:${NODEPORT} \
-  alpine/socat \
-  tcp-listen:${NODEPORT},fork,reuseaddr tcp:${NODE_IP}:${NODEPORT} >/dev/null
+[ -n "${HOST_PORT}" ] || { echo "ERROR: could not determine published host port"; exit 1; }
 
-echo "Open on Windows: http://localhost:${NODEPORT}"
+echo "minikube URL (inside Jenkins): http://127.0.0.1:${PORT}"
+echo "Open on Windows: http://localhost:${HOST_PORT}"
 EOS
           chmod +x /usr/local/bin/expose-django-service
 
