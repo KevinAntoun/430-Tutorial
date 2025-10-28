@@ -318,7 +318,7 @@ done
 
 # Ensure container-wide listener on 0.0.0.0:${PORT} -> 127.0.0.1:${PORT}
 if ! ss -ltn 2>/dev/null | awk '{print $4}' | grep -q ":${PORT}\$"; then
-  nohup socat TCP-LISTEN:${PORT},fork,reuseaddr TCP:127.0.0.1:${PORT} >/dev/null 2>&1 &
+  nohup socat TCP-LISTEN:${PORT},fork,reuseaddr,bind=0.0.0.0 TCP:127.0.0.1:${PORT} >/dev/null 2>&1 &
 fi
 
 # Jenkins container IP on docker bridge (eth0)
