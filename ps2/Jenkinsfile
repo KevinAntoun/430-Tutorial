@@ -66,7 +66,7 @@ pipeline {
       steps {
         sh '''
           set -euo pipefail
-          export NO_PROXY="127.0.0.1,localhost,.local"
+          export NO_PROXY="127.0.0.1,localhost,.local,.svc,cluster.local,10.96.0.0/12,10.244.0.0/16,10.123.0.0/16"
           export no_proxy="${NO_PROXY}"
           unset HTTP_PROXY HTTPS_PROXY http_proxy https_proxy || true
 
@@ -160,7 +160,7 @@ EOSH
       steps {
         script {
           env.TAG   = sh(returnStdout: true, script: 'git rev-parse --short HEAD').trim()
-          env.IMAGE = "${env.APP}:${env.TAG}"
+          env.IMAGE = "${env.APP}:${env.TAG}"]
           echo "IMAGE=${env.IMAGE}"
         }
       }
@@ -184,6 +184,7 @@ EOSH
           set -euo pipefail
           kubectl -n ${NS} apply -f ${MANIFEST_DIR}/deployment.yaml
           kubectl -n ${NS} apply -f ${MANIFEST_DIR}/service.yaml
+          # ensure the deployment uses the fresh image
           kubectl -n ${NS} set image deploy/${DEPLOY} ${CTR}=${IMAGE}
           kubectl -n ${NS} rollout status deploy/${DEPLOY} --timeout=180s
           kubectl -n ${NS} get deploy,pods,svc -o wide
@@ -224,6 +225,10 @@ EOSH
 export MK_ROOT="/var/jenkins_home/minikube/ps2"
 export MINIKUBE_HOME="${MK_ROOT}/.minikube"
 export KUBECONFIG="${MK_ROOT}/.kube/config"
+# harden against proxies
+unset HTTP_PROXY HTTPS_PROXY http_proxy https_proxy
+export NO_PROXY='127.0.0.1,localhost,.local,.svc,cluster.local,10.96.0.0/12,10.244.0.0/16,10.123.0.0/16'
+export no_proxy="${NO_PROXY}"
 exec kubectl "$@"
 EOS
           chmod +x /usr/local/bin/kube-ps2
@@ -234,6 +239,9 @@ EOS
 export MK_ROOT="/var/jenkins_home/minikube/ps2"
 export MINIKUBE_HOME="${MK_ROOT}/.minikube"
 export KUBECONFIG="${MK_ROOT}/.kube/config"
+unset HTTP_PROXY HTTPS_PROXY http_proxy https_proxy
+export NO_PROXY='127.0.0.1,localhost,.local,.svc,cluster.local,10.96.0.0/12,10.244.0.0/16,10.123.0.0/16'
+export no_proxy="${NO_PROXY}"
 exec minikube -p minikube "$@"
 EOS
           chmod +x /usr/local/bin/mk-ps2
@@ -270,22 +278,45 @@ echo "Bridge stopped"
 EOS
           chmod +x /usr/local/bin/stop-ps2-bridge
 
-          # expose-django-service (NodePort only)
+          # expose-django-service (NodePort-only, proxy-safe, waits for endpoints)
           cat > /usr/local/bin/expose-django-service <<'EOS'
 #!/usr/bin/env sh
 set -eu
 NS="${1:-default}"
 SVC="${2:-django-service}"
 
+# Kill proxies so kubectl doesn't hit Jenkins' login
+unset HTTP_PROXY HTTPS_PROXY http_proxy https_proxy
+export NO_PROXY='127.0.0.1,localhost,.local,.svc,cluster.local,10.96.0.0/12,10.244.0.0/16,10.123.0.0/16'
+export no_proxy="${NO_PROXY}"
+
+# Ensure service exists
+if ! kube-ps2 -n "${NS}" get svc "${SVC}" >/dev/null 2>&1; then
+  echo "ERROR: Service ${NS}/${SVC} does not exist."
+  exit 1
+fi
+
+# Ensure NodePort type
+TYPE="$(kube-ps2 -n "${NS}" get svc "${SVC}" -o jsonpath='{.spec.type}')"
+if [ "${TYPE}" != "NodePort" ]; then
+  echo "Patching ${NS}/${SVC} to NodePort…"
+  kube-ps2 -n "${NS}" patch svc "${SVC}" -p '{"spec":{"type":"NodePort"}}' >/dev/null
+fi
+
+# Wait for endpoints (up to 60s)
+echo -n "Waiting for ${NS}/${SVC} endpoints"
+i=0
+while :; do
+  EP="$(kube-ps2 -n "${NS}" get ep "${SVC}" -o jsonpath='{.subsets[0].addresses[0].ip}' 2>/dev/null || true)"
+  if [ -n "${EP}" ]; then echo " … OK (${EP})"; break; fi
+  i=$((i+1)); [ "${i}" -ge 60 ] && { echo " … TIMEOUT"; kube-ps2 -n "${NS}" get ep "${SVC}" -o wide || true; exit 1; }
+  echo -n "."
+  sleep 1
+done
+
 # Get NodePort
-NODEPORT="$(kubectl -n "${NS}" get svc "${SVC}" -o jsonpath='{.spec.ports[0].nodePort}' 2>/dev/null || true)"
-case "${NODEPORT}" in
-  ''|*[!0-9]*) 
-    echo "ERROR: cannot detect NodePort for ${NS}/${SVC}"
-    kubectl -n "${NS}" get svc "${SVC}" -o wide || true
-    exit 1
-    ;;
-esac
+NODEPORT="$(kube-ps2 -n "${NS}" get svc "${SVC}" -o jsonpath='{.spec.ports[0].nodePort}' 2>/dev/null || true)"
+case "${NODEPORT}" in ''|*[!0-9]*) echo "ERROR: cannot detect NodePort for ${NS}/${SVC}"; kube-ps2 -n "${NS}" get svc "${SVC}" -o wide; exit 1;; esac
 
 # Determine Minikube IP
 NODE_IP="$(mk-ps2 ip 2>/dev/null || true)"
@@ -312,10 +343,13 @@ EOS
       }
     }
 
+    // Optional: print the Windows-friendly URL
     stage('Expose Django URL (print for Windows)') {
       steps {
         sh '''
           set -euo pipefail
+          # make sure the API bridge is alive before exposing the service
+          start-ps2-bridge
           echo "Discovering a Windows-friendly URL for django-service..."
           expose-django-service default django-service || true
         '''
