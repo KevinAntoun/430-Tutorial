@@ -44,7 +44,7 @@ pipeline {
             chmod +x /usr/local/bin/kubectl
           fi
           apt-get update -y
-          apt-get install -y --no-install-recommends iproute2 socat
+          apt-get install -y --no-install-recommends iproute2 socat curl ca-certificates
           mkdir -p "${MINIKUBE_HOME}" "$(dirname "${KUBECONFIG}")"
         '''
       }
@@ -224,7 +224,6 @@ EOSH
 export MK_ROOT="/var/jenkins_home/minikube/ps2"
 export MINIKUBE_HOME="${MK_ROOT}/.minikube"
 export KUBECONFIG="${MK_ROOT}/.kube/config"
-# harden against proxies
 unset HTTP_PROXY HTTPS_PROXY http_proxy https_proxy
 export NO_PROXY='127.0.0.1,localhost,.local,.svc,cluster.local,10.96.0.0/12,10.244.0.0/16,10.123.0.0/16'
 export no_proxy="${NO_PROXY}"
@@ -277,87 +276,134 @@ echo "Bridge stopped"
 EOS
           chmod +x /usr/local/bin/stop-ps2-bridge
 
-          # expose-django-service (IPv4-safe publish to Windows)
+          # expose-django-service (robust: tries tunnel URL, falls back to NodePort+minikube IP; verifies end-to-end)
           cat > /usr/local/bin/expose-django-service <<'EOS'
 #!/usr/bin/env sh
 set -eu
 NS="${1:-default}"
 SVC="${2:-django-service}"
 
-# Neutralize proxies so kubectl/minikube don't hit Jenkins login
 unset HTTP_PROXY HTTPS_PROXY http_proxy https_proxy
 export NO_PROXY='127.0.0.1,localhost,.local,.svc,cluster.local,10.96.0.0/12,10.244.0.0/16,10.123.0.0/16'
 export no_proxy="${NO_PROXY}"
 
-# Validate service exists
-if ! kube-ps2 -n "${NS}" get svc "${SVC}" >/dev/null 2>&1; then
-  echo "ERROR: Service ${NS}/${SVC} does not exist."
-  exit 1
-fi
+fail() { echo "ERROR: $*" >&2; exit 1; }
 
-# Kill any old tunnel processes for this service
+# Verify service exists
+kube-ps2 -n "${NS}" get svc "${SVC}" >/dev/null 2>&1 || fail "Service ${NS}/${SVC} not found"
+
+# Helper: publish a local port from Windows host to some target <HOST:PORT> reachable from publisher container
+publish_and_verify() {
+  HOST_LPORT="$1"        # desired host port (or empty for random)
+  TARGET_HOST="$2"       # where the publisher should connect to
+  TARGET_PORT="$3"       # target port
+  NAME="$4"              # container name
+
+  docker rm -f "${NAME}" >/dev/null 2>&1 || true
+
+  PUB_ARG="-p 127.0.0.1:${HOST_LPORT}:${TARGET_PORT}"
+  if [ -z "${HOST_LPORT}" ]; then
+    PUB_ARG="-p 127.0.0.1::${TARGET_PORT}"
+  fi
+
+  # Run publisher on the 'bridge' network by default
+  if docker run -d --name "${NAME}" --restart unless-stopped \
+       --network bridge ${PUB_ARG} \
+       alpine/socat \
+       tcp-listen:${TARGET_PORT},fork,reuseaddr,bind=0.0.0.0 tcp:${TARGET_HOST}:${TARGET_PORT} >/dev/null 2>&1; then
+    :
+  else
+    fail "Publisher container failed to start"
+  fi
+
+  # Determine the effective host port
+  MAP="$(docker port "${NAME}" ${TARGET_PORT}/tcp | tail -n1 || true)"
+  HOST_PORT="$(echo "${MAP}" | awk -F':' '{print $NF}')"
+  [ -n "${HOST_PORT}" ] || fail "Could not determine published host port"
+
+  # End-to-end verification from Windows perspective (via host.docker.internal)
+  # If this probe fails, caller may fallback to an alternative method.
+  if docker run --rm --network bridge alpine/curl \
+       -sS --max-time 3 "http://host.docker.internal:${HOST_PORT}/" >/dev/null 2>&1; then
+    echo "${HOST_PORT}"
+    return 0
+  fi
+  echo "VERIFY: host.docker.internal:${HOST_PORT} not reachable; will fallback if possible"
+  echo "${HOST_PORT}"
+  return 1
+}
+
+# Method A: minikube service --url (tunnel to localhost in Jenkins)
+URL_FILE="/tmp/${SVC}.url"; : > "${URL_FILE}"
 pkill -f "minikube.*service.*${SVC}.*--url" >/dev/null 2>&1 || true
-
-# Start minikube's ephemeral URL tunnel in background, capture output
-URL_FILE="/tmp/${SVC}.url"
-: > "${URL_FILE}"
 nohup mk-ps2 service -n "${NS}" "${SVC}" --url > "${URL_FILE}" 2>&1 &
 
-# Wait for a URL like http://127.0.0.1:<RANDOM>
 printf "Starting minikube service --url for %s/%s " "${NS}" "${SVC}"
-PORT=""
-for i in $(seq 1 60); do
-  URL_LINE="$(grep -Eo 'http://127\\.0\\.0\\.1:[0-9]+' "${URL_FILE}" | head -n1 || true)"
-  if [ -n "${URL_LINE}" ]; then
-    PORT="$(echo "${URL_LINE}" | awk -F: '{print $3}')"
-    echo "… OK (${URL_LINE})"
+PORT=""; for i in $(seq 1 60); do
+  LINE="$(grep -Eo 'http://127\\.0\\.0\\.1:[0-9]+' "${URL_FILE}" | head -n1 || true)"
+  if [ -n "${LINE}" ]; then
+    PORT="$(echo "${LINE}" | awk -F: '{print $3}')"
+    echo "… OK (${LINE})"
     break
   fi
-  printf "."
-  sleep 1
+  printf "."; sleep 1
 done
-[ -n "${PORT}" ] || { echo "… TIMEOUT (no URL printed)"; echo "=== BEGIN TUNNEL LOG ==="; cat "${URL_FILE}" || true; echo "=== END TUNNEL LOG ==="; exit 1; }
+if [ -n "${PORT}" ]; then
+  # Ensure listener inside Jenkins container
+  pkill -f "socat TCP-LISTEN:${PORT}," >/dev/null 2>&1 || true
+  nohup socat TCP-LISTEN:${PORT},fork,reuseaddr,bind=0.0.0.0 TCP:127.0.0.1:${PORT} >/dev/null 2>&1 &
+  sleep 0.5
 
-# Ensure container-wide listener 0.0.0.0:${PORT} -> 127.0.0.1:${PORT}
-pkill -f "socat TCP-LISTEN:${PORT}," >/dev/null 2>&1 || true
-nohup socat TCP-LISTEN:${PORT},fork,reuseaddr,bind=0.0.0.0 TCP:127.0.0.1:${PORT} >/dev/null 2>&1 &
-
-# Jenkins container IP on docker bridge (eth0) — robust detection
-if command -v ip >/dev/null 2>&1; then
-  JENKINS_IP="$(ip -4 addr show eth0 | awk '/inet /{print $2}' | cut -d/ -f1)"
+  # Publish to Windows (prefer same port)
+  HOST_PORT="$(publish_and_verify "${PORT}" "$(hostname -I | awk '{print $1}')" "${PORT}" "expose-${SVC}-via-url" || true)"
+  if [ -n "${HOST_PORT}" ] && docker ps --format '{{.Names}}' | grep -q "^expose-${SVC}-via-url$"; then
+    echo "=== DIAG (Method A) ==="
+    ss -ltn | grep ":${PORT}" || echo "No listener on :${PORT} inside Jenkins"
+    docker port "expose-${SVC}-via-url" ${PORT}/tcp || true
+    curl -sS --max-time 2 "http://127.0.0.1:${PORT}/" | head -n 2 || echo "[inner curl failed]"
+    echo "minikube URL (inside Jenkins): http://127.0.0.1:${PORT}"
+    echo "Open on Windows: http://127.0.0.1:${HOST_PORT}"
+    exit 0
+  fi
+  echo "Method A publishing failed verification; trying Method B…"
 fi
-[ -n "${JENKINS_IP:-}" ] || JENKINS_IP="$(hostname -I 2>/dev/null | awk '{print $1}')"
-[ -n "${JENKINS_IP:-}" ] || { echo "ERROR: cannot determine Jenkins container IP"; exit 1; }
 
-# Publish to Windows on IPv4 loopback; prefer same port, else random host port (still IPv4-only)
-NAME="expose-${SVC}-via-url"
+# Method B: NodePort directly via minikube container IP (connect publisher to minikube-net)
+NODE_PORT="$(kube-ps2 -n "${NS}" get svc "${SVC}" -o jsonpath='{.spec.ports[0].nodePort}')"
+[ -n "${NODE_PORT}" ] || fail "Could not determine NodePort"
+MINIKUBE_IP="$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' minikube 2>/dev/null || true)"
+[ -n "${MINIKUBE_IP}" ] || fail "Could not determine minikube container IP"
+
+# Run publisher on the SAME network as minikube to reach its IP, while still publishing to Windows
+NAME="expose-${SVC}-via-nodeport"
 docker rm -f "${NAME}" >/dev/null 2>&1 || true
 if docker run -d --name "${NAME}" --restart unless-stopped \
-     --network bridge \
-     -p 127.0.0.1:${PORT}:${PORT} \
+     --network "${MK_DOCKER_NET:-minikube-net}" \
+     -p 127.0.0.1:${NODE_PORT}:${NODE_PORT} \
      alpine/socat \
-     tcp-listen:${PORT},fork,reuseaddr,bind=0.0.0.0 tcp:${JENKINS_IP}:${PORT} >/dev/null 2>&1; then
-  HOST_PORT="${PORT}"
+     tcp-listen:${NODE_PORT},fork,reuseaddr,bind=0.0.0.0 tcp:${MINIKUBE_IP}:${NODE_PORT} >/dev/null 2>&1; then
+  :
 else
-  docker run -d --name "${NAME}" --restart unless-stopped \
-    --network bridge \
-    -p 127.0.0.1::${PORT} \
-    alpine/socat \
-    tcp-listen:${PORT},fork,reuseaddr,bind=0.0.0.0 tcp:${JENKINS_IP}:${PORT} >/dev/null
-  HOST_MAP="$(docker port "${NAME}" ${PORT}/tcp | tail -n1 || true)"
-  HOST_PORT="$(echo "${HOST_MAP}" | awk -F':' '{print $NF}')"
+  fail "Publisher (NodePort) failed to start"
 fi
-[ -n "${HOST_PORT}" ] || { echo "ERROR: could not determine published host port"; exit 1; }
 
-# Diagnostics (helps catch bind issues immediately)
-echo "=== DIAG ==="
-ss -ltn | grep ":${PORT}" || echo "No listener on :${PORT} inside Jenkins"
-docker port "${NAME}" ${PORT}/tcp || true
-curl -sS --max-time 2 "http://127.0.0.1:${PORT}/" | head -n 2 || echo "[inner curl failed]"
+MAP="$(docker port "${NAME}" ${NODE_PORT}/tcp | tail -n1 || true)"
+HOST_PORT="$(echo "${MAP}" | awk -F':' '{print $NF}')"
+[ -n "${HOST_PORT}" ] || fail "Could not determine published host port (NodePort)"
 
-echo "minikube URL (inside Jenkins): http://127.0.0.1:${PORT}"
-# IMPORTANT: print IPv4 loopback to avoid Windows 'localhost' => ::1
-echo "Open on Windows: http://127.0.0.1:${HOST_PORT}"
+# Verify from host viewpoint
+if docker run --rm --network bridge alpine/curl \
+     -sS --max-time 5 "http://host.docker.internal:${HOST_PORT}/" >/dev/null 2>&1; then
+  echo "=== DIAG (Method B) ==="
+  docker port "${NAME}" ${NODE_PORT}/tcp || true
+  echo "NodePort target: ${MINIKUBE_IP}:${NODE_PORT}"
+  echo "Open on Windows: http://127.0.0.1:${HOST_PORT}"
+  exit 0
+fi
+
+echo "Verification failed for both methods."
+echo "Try manually from Windows: http://127.0.0.1:${HOST_PORT}"
+exit 1
 EOS
           chmod +x /usr/local/bin/expose-django-service
 
@@ -371,7 +417,6 @@ EOS
       steps {
         sh '''
           set -euo pipefail
-          # ensure the background bridge exists (kube-apiserver convenience)
           start-ps2-bridge
           echo "Discovering a Windows-friendly URL for django-service..."
           expose-django-service default django-service || true
