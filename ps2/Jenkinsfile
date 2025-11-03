@@ -280,76 +280,47 @@ echo "Bridge stopped"
 EOS
           chmod +x /usr/local/bin/stop-ps2-bridge
 
-          # expose-django-service (minikube url helper for Windows)
+          # expose-django-service (NEW: NodePort targeting with fallback)
           cat > /usr/local/bin/expose-django-service <<'EOS'
 #!/usr/bin/env sh
 set -eu
+
 NS="${1:-default}"
 SVC="${2:-django-service}"
 : "${MK_DOCKER_NET:=minikube-net}"
 : "${PS2_AGENT_CONTAINER_ID:=}"
 
-fail() {
-  echo "ERROR: $*" >&2
-  exit 1
-}
+fail() { echo "ERROR: $*" >&2; exit 1; }
+log()  { echo "[expose] $*"; }
 
-log() {
-  echo "[expose] $*"
-}
-
+# --- helpers to resolve Jenkins container id/ip on MK_DOCKER_NET ---
 resolve_self_container() {
   set --
-  if [ -n "${PS2_AGENT_CONTAINER_ID}" ]; then
-    set -- "$@" "${PS2_AGENT_CONTAINER_ID}"
-  fi
-  h="$(hostname 2>/dev/null || true)"
-  if [ -n "${h}" ]; then
-    set -- "$@" "${h}"
-  fi
+  if [ -n "${PS2_AGENT_CONTAINER_ID}" ]; then set -- "$@" "${PS2_AGENT_CONTAINER_ID}"; fi
+  h="$(hostname 2>/dev/null || true)"; [ -n "${h}" ] && set -- "$@" "${h}"
   if [ -r /proc/self/cgroup ]; then
     cgroup_guess="$(grep -Eo '[0-9a-f]{64}' /proc/self/cgroup 2>/dev/null | head -n1)"
-    if [ -n "${cgroup_guess}" ]; then
-      set -- "$@" "${cgroup_guess}"
-    fi
+    [ -n "${cgroup_guess}" ] && set -- "$@" "${cgroup_guess}"
   fi
   if [ -r /proc/1/cpuset ]; then
     cpuset_guess="$(awk -F/ 'NF {print $NF}' /proc/1/cpuset 2>/dev/null)"
-    if [ -n "${cpuset_guess}" ]; then
-      set -- "$@" "${cpuset_guess}"
-    fi
+    [ -n "${cpuset_guess}" ] && set -- "$@" "${cpuset_guess}"
   fi
   for guess in "$@"; do
-    [ -n "${guess}" ] || continue
-    if docker inspect "${guess}" >/dev/null 2>&1; then
-      docker inspect -f '{{.Id}}' "${guess}" 2>/dev/null && return 0
-    fi
-    cand="$(docker ps --no-trunc --filter "id=${guess}" --format '{{.ID}}' | head -n1)"
-    if [ -n "${cand}" ]; then
-      echo "${cand}"
-      return 0
-    fi
-    cand="$(docker ps --filter "name=${guess}" --format '{{.ID}}' | head -n1)"
-    if [ -n "${cand}" ]; then
-      echo "${cand}"
-      return 0
-    fi
+    [ -z "${guess}" ] && continue
+    if docker inspect "${guess}" >/dev/null 2>&1; then docker inspect -f '{{.Id}}' "${guess}" && return 0; fi
+    cand="$(docker ps --no-trunc --filter "id=${guess}" --format '{{.ID}}' | head -n1)"; [ -n "${cand}" ] && { echo "${cand}"; return 0; }
+    cand="$(docker ps --filter "name=${guess}" --format '{{.ID}}' | head -n1)"; [ -n "${cand}" ] && { echo "${cand}"; return 0; }
   done
   return 1
 }
 
+# --- prechecks ---
 kube-ps2 -n "${NS}" get svc "${SVC}" >/dev/null 2>&1 || fail "Service ${NS}/${SVC} not found"
+docker network inspect "${MK_DOCKER_NET}" >/dev/null 2>&1 || fail "Docker network ${MK_DOCKER_NET} not found"
 
-if ! docker network inspect "${MK_DOCKER_NET}" >/dev/null 2>&1; then
-  fail "Docker network ${MK_DOCKER_NET} not found; run the Jenkins pipeline setup first."
-fi
-
-SELF_ID="$(resolve_self_container || true)"
-[ -n "${SELF_ID}" ] || fail "Unable to determine the Jenkins container id; set PS2_AGENT_CONTAINER_ID explicitly if this job runs inside Docker."
-
-if ! docker inspect "${SELF_ID}" >/dev/null 2>&1; then
-  fail "Unable to inspect container ${SELF_ID}; ensure Docker access is available and PS2_AGENT_CONTAINER_ID is correct."
-fi
+SELF_ID="$(resolve_self_container || true)"; [ -n "${SELF_ID}" ] || fail "Unable to determine the Jenkins container id"
+docker inspect "${SELF_ID}" >/dev/null 2>&1 || fail "Unable to inspect container ${SELF_ID}"
 
 attached="$(docker inspect -f '{{if index .NetworkSettings.Networks "'"${MK_DOCKER_NET}"'"}}yes{{end}}' "${SELF_ID}" 2>/dev/null || true)"
 if [ "${attached}" != "yes" ]; then
@@ -358,12 +329,25 @@ if [ "${attached}" != "yes" ]; then
 fi
 
 SELF_IP="$(docker inspect -f '{{with index .NetworkSettings.Networks "'"${MK_DOCKER_NET}"'"}}{{.IPAddress}}{{end}}' "${SELF_ID}" 2>/dev/null || true)"
-if [ -z "${SELF_IP}" ]; then
-  log "Attaching current container (${SELF_ID}) to ${MK_DOCKER_NET}"
-  docker network connect "${MK_DOCKER_NET}" "${SELF_ID}" >/dev/null 2>&1 || true
-  SELF_IP="$(docker inspect -f '{{with index .NetworkSettings.Networks "'"${MK_DOCKER_NET}"'"}}{{.IPAddress}}{{end}}' "${SELF_ID}" 2>/dev/null || true)"
-fi
-[ -n "${SELF_IP}" ] || fail "Container ${SELF_ID} has no IP on ${MK_DOCKER_NET}; connect it manually."
+[ -n "${SELF_IP}" ] || fail "Container ${SELF_ID} has no IP on ${MK_DOCKER_NET}"
+
+TYPE="$(kube-ps2 -n "${NS}" get svc "${SVC}" -o jsonpath='{.spec.type}')"
+PORTMAP="$(kube-ps2 -n "${NS}" get svc "${SVC}" -o jsonpath='{range .spec.ports[*]}{.port}:{.nodePort}{"\n"}{end}')"
+NODE_IP="$(mk-ps2 ip)"
+
+get_nodeport_for() {
+  svc_port="$1"
+  echo "$PORTMAP" | awk -F: -v p="$svc_port" '$1==p && $2!="": {print $2; exit}'
+}
+
+ensure_pf_for() {
+  local local_p="$1" target_p="$2"
+  if ! ss -ltn 2>/dev/null | awk '{print $4}' | grep -q ":$local_p$"; then
+    nohup kube-ps2 -n "${NS}" port-forward "svc/${SVC}" --address=0.0.0.0 "${local_p}:${target_p}" >/tmp/pf-"${SVC}"-"${local_p}".log 2>&1 &
+    # small wait until the listener is up
+    for i in $(seq 1 60); do ss -ltn 2>/dev/null | awk '{print $4}' | grep -q ":$local_p$" && break || sleep 0.2; done
+  fi
+}
 
 log "Fetching service URLs via minikube (timeout 120s)..."
 set +e
@@ -372,6 +356,7 @@ MK_STATUS=$?
 set -e
 RAW_URLS="$(printf '%s\n' "${MK_URLS_RAW}" | tr -d '\r')"
 URL_LINES="$(printf '%s\n' "${RAW_URLS}" | awk 'index($0,"://")')"
+
 if [ "${MK_STATUS}" -ne 0 ]; then
   stripped="$(printf '%s' "${URL_LINES}" | tr -d '\n')"
   if [ "${MK_STATUS}" -eq 124 ] && [ -n "${stripped}" ]; then
@@ -381,18 +366,13 @@ if [ "${MK_STATUS}" -ne 0 ]; then
     fail "minikube service --url failed (exit ${MK_STATUS}); ensure the cluster and service are healthy."
   fi
 fi
-if [ -z "$(printf '%s' "${URL_LINES}" | tr -d '\n')" ]; then
-  printf '%s\n' "${RAW_URLS}" >&2
-  fail "minikube service --url returned no URLs for ${NS}/${SVC}"
-fi
+[ -n "$(printf '%s' "${URL_LINES}" | tr -d '\n')" ] || { printf '%s\n' "${RAW_URLS}" >&2; fail "minikube service --url returned no URLs for ${NS}/${SVC}"; }
 
-log "Removing stale Windows proxy containers for ${SVC}"
-OLD_IFS="${IFS}"
-IFS='
+log "Removing stale proxy containers for ${SVC}"
+OLD_IFS="${IFS}"; IFS='
 '
 for cid in $(docker ps -a --filter "label=com.ps2.expose.service=${SVC}" --format '{{.ID}}'); do
-  [ -n "${cid}" ] || continue
-  docker rm -f "${cid}" >/dev/null 2>&1 || true
+  [ -n "${cid}" ] && docker rm -f "${cid}" >/dev/null 2>&1 || true
 done
 IFS="${OLD_IFS}"
 
@@ -407,32 +387,48 @@ while IFS= read -r url; do
   COUNT=$((COUNT + 1))
 
   proto_raw="${url%%://*}"
-  if [ "${proto_raw}" = "${url}" ]; then
-    proto_raw="http"
-  fi
+  [ "${proto_raw}" = "${url}" ] && proto_raw="http"
   proto="$(printf '%s' "${proto_raw}" | tr '[:upper:]' '[:lower:]')"
 
   rest="${url#*://}"
   host_port="${rest%%/*}"
   host="${host_port%%:*}"
   port="${host_port##*:}"
-  if [ "${host}" = "${port}" ]; then
-    port=""
-  fi
+  [ "${host}" = "${port}" ] && port=""
 
   [ -n "${host}" ] || fail "Could not parse host from URL: ${url}"
   [ -n "${port}" ] || fail "Could not parse port from URL: ${url}"
 
-  case "${host}" in
-    127.0.0.1|localhost)
-      target_host="${SELF_IP}"
-      ;;
-    *)
-      target_host="${host}"
-      ;;
-  esac
+  svc_port="${port}"  # assume servicePort equals URL port (true for NodePort/LB and typical --url)
 
-  proxy_name="$(printf 'expose-%s-%s-%s' "${SVC}" "${proto}" "${port}")"
+  TARGET_HOST=""
+  TARGET_PORT=""
+
+  if [ "${host}" = "127.0.0.1" ] || [ "${host}" = "localhost" ]; then
+    if [ "${TYPE}" = "NodePort" ]; then
+      node_p="$(get_nodeport_for "${svc_port}")"
+      if [ -n "${node_p}" ]; then
+        TARGET_HOST="${NODE_IP}"
+        TARGET_PORT="${node_p}"
+      else
+        # fall back to port-forward bound to 0.0.0.0
+        TARGET_HOST="${SELF_IP}"
+        TARGET_PORT="${svc_port}"
+        ensure_pf_for "${TARGET_PORT}" "${svc_port}"
+      fi
+    else
+      # ClusterIP (or LoadBalancer before IP ready): use port-forward bound to 0.0.0.0
+      TARGET_HOST="${SELF_IP}"
+      TARGET_PORT="${svc_port}"
+      ensure_pf_for "${TARGET_PORT}" "${svc_port}"
+    fi
+  else
+    # routable as printed (node IP, LB IP, etc.)
+    TARGET_HOST="${host}"
+    TARGET_PORT="${port}"
+  fi
+
+  proxy_name="$(printf 'expose-%s-%s-%s' "${SVC}" "${proto}" "${TARGET_PORT}")"
   docker rm -f "${proxy_name}" >/dev/null 2>&1 || true
 
   if ! docker run -d --name "${proxy_name}" \
@@ -440,28 +436,28 @@ while IFS= read -r url; do
       --restart unless-stopped \
       --label com.ps2.expose=1 \
       --label com.ps2.expose.service="${SVC}" \
-      --label com.ps2.expose.port="${port}" \
-      -p 127.0.0.1::"${port}" \
+      --label com.ps2.expose.port="${TARGET_PORT}" \
+      -p 127.0.0.1::"${TARGET_PORT}" \
       alpine/socat \
-      TCP-LISTEN:"${port}",fork,reuseaddr,bind=0.0.0.0 TCP:"${target_host}":"${port}" >/dev/null 2>&1; then
+      TCP-LISTEN:"${TARGET_PORT}",fork,reuseaddr,bind=0.0.0.0 TCP:"${TARGET_HOST}":"${TARGET_PORT}" >/dev/null 2>&1; then
     fail "Failed to start proxy container ${proxy_name}"
   fi
 
-  host_port="$(docker port "${proxy_name}" "${port}/tcp" | awk -F':' 'NF==2 {print $2}' | tail -n1)"
+  host_port="$(docker port "${proxy_name}" "${TARGET_PORT}/tcp" | awk -F':' 'NF==2 {print $2}' | tail -n1)"
   [ -n "${host_port}" ] || fail "Could not determine published host port for ${proxy_name}"
 
   windows_url="$(printf '%s://127.0.0.1:%s' "${proto}" "${host_port}")"
-  WIN_URLS="${WIN_URLS}${windows_url}\n"
-  log "Mapped ${url} -> ${windows_url} (proxy ${proxy_name})"
+  WIN_URLS="${WIN_URLS}${windows_url}    (from ${url})\n"
+  log "Mapped ${url} -> ${windows_url} (proxy ${proxy_name} -> ${TARGET_HOST}:${TARGET_PORT})"
 done <<EOF
 ${URL_LINES}
 EOF
 
-[ "${COUNT}" -gt 0 ] || fail "minikube service --url produced no usable entries"
+[ "${COUNT}" -gt 0 ] || fail "No usable URLs produced"
 
 printf '\nWindows-friendly URLs now reachable on this machine:\n'
 printf '%b' "${WIN_URLS}"
-printf 'To tear them down later: docker ps --filter "label=com.ps2.expose.service=%s" -q | xargs docker rm -f\n' "${SVC}"
+printf 'To tear them down later: docker ps --filter "label=com.ps2.expose.service=%s" -q | xargs -r docker rm -f\n' "${SVC}"
 EOS
           chmod +x /usr/local/bin/expose-django-service
 
@@ -476,7 +472,7 @@ EOS
         sh '''
           set -euo pipefail
           start-ps2-bridge
-          echo "Discovering a Windows-friendly URL for django-service..."
+          echo "Discovering Windows-friendly URLs for django-service..."
           expose-django-service default django-service
         '''
       }
