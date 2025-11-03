@@ -340,18 +340,22 @@ publish_and_verify() {
 
   CONTAINER_STARTED=0
   LAST_TARGET=""
+  LAST_CID=""
   for TARGET_HOST in ${TARGET_HOSTS}; do
     [ -z "${TARGET_HOST}" ] && continue
-    echo "Starting proxy '${PROXY_NAME}' on ${PROXY_NETWORK} targeting ${TARGET_HOST}:${TARGET_PORT}..."
-    if docker run -d --name "${PROXY_NAME}" --restart unless-stopped \
+    echo "Starting proxy '${PROXY_NAME}' on ${PROXY_NETWORK} targeting ${TARGET_HOST}:${TARGET_PORT}..." >&2
+    if CID="$(docker run -d --name "${PROXY_NAME}" --restart unless-stopped \
          --network "${PROXY_NETWORK}" ${PUB_ARG} \
          alpine/socat \
-         TCP-LISTEN:${TARGET_PORT},fork,reuseaddr,bind=0.0.0.0 tcp:${TARGET_HOST}:${TARGET_PORT}; then
+         TCP-LISTEN:${TARGET_PORT},fork,reuseaddr,bind=0.0.0.0 tcp:${TARGET_HOST}:${TARGET_PORT} 2>&1)"; then
+      CID="$(printf '%s' "${CID}" | tail -n1)"
       CONTAINER_STARTED=1
       LAST_TARGET="${TARGET_HOST}"
+      LAST_CID="${CID}"
       break
     fi
-    echo "WARN: Proxy '${PROXY_NAME}' could not reach ${TARGET_HOST}:${TARGET_PORT}. Retrying with next candidate..."
+    echo "${CID}" >&2
+    echo "WARN: Proxy '${PROXY_NAME}' could not reach ${TARGET_HOST}:${TARGET_PORT}. Retrying with next candidate..." >&2
   done
 
   [ "${CONTAINER_STARTED}" -eq 1 ] || fail "Proxy container '${PROXY_NAME}' failed to start on any host (${TARGET_HOSTS})."
@@ -359,16 +363,16 @@ publish_and_verify() {
   EFFECTIVE_HOST_PORT="$(docker port "${PROXY_NAME}" "${TARGET_PORT}/tcp" | awk -F':' '{print $NF}' | tail -n1)"
   [ -n "${EFFECTIVE_HOST_PORT}" ] || fail "Could not determine published host port for ${PROXY_NAME}"
 
-  echo "Proxy '${PROXY_NAME}' is running (Windows -> 127.0.0.1:${EFFECTIVE_HOST_PORT} -> ${LAST_TARGET}:${TARGET_PORT})."
-  echo "Verifying reachability from a clean container namespace..."
+  echo "Proxy '${PROXY_NAME}' is running (container ${LAST_CID}) (Windows -> 127.0.0.1:${EFFECTIVE_HOST_PORT} -> ${LAST_TARGET}:${TARGET_PORT})." >&2
+  echo "Verifying reachability from a clean container namespace..." >&2
   if docker run --rm --network bridge alpine/curl -sS --max-time 5 "http://host.docker.internal:${EFFECTIVE_HOST_PORT}/" >/dev/null 2>&1; then
-    echo "Verification successful."
-    echo "${EFFECTIVE_HOST_PORT}"
+    echo "Verification successful." >&2
+    printf '%s\n' "${EFFECTIVE_HOST_PORT}"
     return 0
   fi
 
-  echo "WARN: Verification via host.docker.internal:${EFFECTIVE_HOST_PORT} failed. The port may still be accessible from Windows."
-  echo "${EFFECTIVE_HOST_PORT}"
+  echo "WARN: Verification via host.docker.internal:${EFFECTIVE_HOST_PORT} failed. The port may still be accessible from Windows." >&2
+  printf '%s\n' "${EFFECTIVE_HOST_PORT}"
   return 1
 }
 
