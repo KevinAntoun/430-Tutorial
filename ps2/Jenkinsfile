@@ -48,7 +48,8 @@ pipeline {
             chmod +x /usr/local/bin/kubectl
           fi
           apt-get update -y
-          apt-get install -y --no-install-recommends iproute2 socat curl ca-certificates procps
+          # ADDED: jq for robust JSON parsing
+          apt-get install -y --no-install-recommends iproute2 socat curl ca-certificates procps jq
           mkdir -p "${MINIKUBE_HOME}" "$(dirname "${KUBECONFIG}")"
         '''
       }
@@ -280,7 +281,7 @@ echo "Bridge stopped"
 EOS
           chmod +x /usr/local/bin/stop-ps2-bridge
 
-          # expose-django-service (NEW: NodePort targeting with fallback)
+          # expose-django-service (NodePort targeting + port-forward fallback, using jq)
           cat > /usr/local/bin/expose-django-service <<'EOS'
 #!/usr/bin/env sh
 set -eu
@@ -332,19 +333,24 @@ SELF_IP="$(docker inspect -f '{{with index .NetworkSettings.Networks "'"${MK_DOC
 [ -n "${SELF_IP}" ] || fail "Container ${SELF_ID} has no IP on ${MK_DOCKER_NET}"
 
 TYPE="$(kube-ps2 -n "${NS}" get svc "${SVC}" -o jsonpath='{.spec.type}')"
-PORTMAP="$(kube-ps2 -n "${NS}" get svc "${SVC}" -o jsonpath='{range .spec.ports[*]}{.port}:{.nodePort}{"\n"}{end}')"
+
+# Robust port map via jq: lines of "servicePort:nodePort" (nodePort empty if not applicable)
+PORTMAP="$(
+  kube-ps2 -n "${NS}" get svc "${SVC}" -o json \
+  | jq -r '.spec.ports[] | "\(.port):\(.nodePort // "")"'
+)"
+
 NODE_IP="$(mk-ps2 ip)"
 
 get_nodeport_for() {
   svc_port="$1"
-  echo "$PORTMAP" | awk -F: -v p="$svc_port" '$1==p && $2!="": {print $2; exit}'
+  echo "$PORTMAP" | awk -F: -v p="$svc_port" '$1==p && $2!="" {print $2; exit}'
 }
 
 ensure_pf_for() {
   local local_p="$1" target_p="$2"
   if ! ss -ltn 2>/dev/null | awk '{print $4}' | grep -q ":$local_p$"; then
     nohup kube-ps2 -n "${NS}" port-forward "svc/${SVC}" --address=0.0.0.0 "${local_p}:${target_p}" >/tmp/pf-"${SVC}"-"${local_p}".log 2>&1 &
-    # small wait until the listener is up
     for i in $(seq 1 60); do ss -ltn 2>/dev/null | awk '{print $4}' | grep -q ":$local_p$" && break || sleep 0.2; done
   fi
 }
@@ -386,24 +392,19 @@ while IFS= read -r url; do
   [ -n "${url}" ] || continue
   COUNT=$((COUNT + 1))
 
-  proto_raw="${url%%://*}"
-  [ "${proto_raw}" = "${url}" ] && proto_raw="http"
+  proto_raw="${url%%://*}"; [ "${proto_raw}" = "${url}" ] && proto_raw="http"
   proto="$(printf '%s' "${proto_raw}" | tr '[:upper:]' '[:lower:]')"
 
-  rest="${url#*://}"
-  host_port="${rest%%/*}"
-  host="${host_port%%:*}"
-  port="${host_port##*:}"
+  rest="${url#*://}"; host_port="${rest%%/*}"
+  host="${host_port%%:*}"; port="${host_port##*:}"
   [ "${host}" = "${port}" ] && port=""
 
   [ -n "${host}" ] || fail "Could not parse host from URL: ${url}"
   [ -n "${port}" ] || fail "Could not parse port from URL: ${url}"
 
-  svc_port="${port}"  # assume servicePort equals URL port (true for NodePort/LB and typical --url)
+  svc_port="${port}"  # servicePort typically equals URL port
 
-  TARGET_HOST=""
-  TARGET_PORT=""
-
+  TARGET_HOST=""; TARGET_PORT=""
   if [ "${host}" = "127.0.0.1" ] || [ "${host}" = "localhost" ]; then
     if [ "${TYPE}" = "NodePort" ]; then
       node_p="$(get_nodeport_for "${svc_port}")"
@@ -411,19 +412,16 @@ while IFS= read -r url; do
         TARGET_HOST="${NODE_IP}"
         TARGET_PORT="${node_p}"
       else
-        # fall back to port-forward bound to 0.0.0.0
         TARGET_HOST="${SELF_IP}"
         TARGET_PORT="${svc_port}"
         ensure_pf_for "${TARGET_PORT}" "${svc_port}"
       fi
     else
-      # ClusterIP (or LoadBalancer before IP ready): use port-forward bound to 0.0.0.0
       TARGET_HOST="${SELF_IP}"
       TARGET_PORT="${svc_port}"
       ensure_pf_for "${TARGET_PORT}" "${svc_port}"
     fi
   else
-    # routable as printed (node IP, LB IP, etc.)
     TARGET_HOST="${host}"
     TARGET_PORT="${port}"
   fi
@@ -443,7 +441,7 @@ while IFS= read -r url; do
     fail "Failed to start proxy container ${proxy_name}"
   fi
 
-  host_port="$(docker port "${proxy_name}" "${TARGET_PORT}/tcp" | awk -F':' 'NF==2 {print $2}' | tail -n1)"
+  host_port="$(docker port "${proxy_name}" "${TARGET_PORT}/tcp" | awk -F: 'NF==2 {print $2}' | tail -n1)"
   [ -n "${host_port}" ] || fail "Could not determine published host port for ${proxy_name}"
 
   windows_url="$(printf '%s://127.0.0.1:%s' "${proto}" "${host_port}")"
@@ -466,7 +464,7 @@ EOS
       }
     }
 
-    // Optional: print the Windows-friendly URL
+    // Optional: print the Windows-friendly URL(s)
     stage('Expose Django URL (print for Windows)') {
       steps {
         sh '''
