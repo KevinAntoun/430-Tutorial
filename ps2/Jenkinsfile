@@ -316,10 +316,16 @@ fi
 
 set +e
 MK_URLS_RAW="$(mk-ps2 service -n "${NS}" "${SVC}" --url 2>&1)"
+log "Fetching service URLs via minikube (timeout 120s)..."
+set +e
+MK_URLS_RAW="$(timeout 120 mk-ps2 service -n "${NS}" "${SVC}" --url 2>&1)"
 MK_STATUS=$?
 set -e
 if [ "${MK_STATUS}" -ne 0 ]; then
   printf '%s\n' "${MK_URLS_RAW}" >&2
+  if [ "${MK_STATUS}" -eq 124 ]; then
+    fail "Timed out waiting for minikube to expose ${NS}/${SVC}; check pod readiness and NodePort."
+  fi
   fail "minikube service --url failed; ensure the cluster and service are healthy."
 fi
 RAW_URLS="$(printf '%s\n' "${MK_URLS_RAW}" | tr -d '\r')"
