@@ -426,53 +426,61 @@ else
   echo "Skipping NodePort exposure (mode=${MODE})."
 fi
 
-# --- Method A: run 'minikube service --url' and surface every discovered tunnel ---
+# --- Method A: run a port-forward (service-url style) and surface the tunnel ---
 if [ "${DO_SERVICE}" -eq 1 ]; then
   echo ""
-  echo "Attempting Method A: Exposing via 'minikube service --url'..."
-  URL_FILE="/tmp/${SVC}.url"; : > "${URL_FILE}"
-  pkill -f "minikube.*service.*${SVC}.*--url" >/dev/null 2>&1 || true
+  echo "Attempting Method A: Exposing via 'kubectl port-forward' (service-url style)..."
+  SERVICE_PORT="$(kube-ps2 -n "${NS}" get svc "${SVC}" -o jsonpath='{.spec.ports[0].port}' 2>/dev/null || true)"
 
-  nohup mk-ps2 service -n "${NS}" "${SVC}" --url > "${URL_FILE}" 2>&1 &
+  if [ -z "${SERVICE_PORT}" ]; then
+    echo "WARN: Could not determine service port for ${NS}/${SVC}. Skipping Method A."
+  else
+    PF_LOG="/tmp/${SVC}.port-forward.log"; : > "${PF_LOG}"
+    pkill -f "port-forward.*svc/${SVC}" >/dev/null 2>&1 || true
 
-  FOUND_URLS=""
-  printf "Waiting for 'minikube service --url' tunnel "
-  for i in $(seq 1 60); do
-    FOUND_URLS="$(grep -Eo 'http://127\\.0\\.0\\.1:[0-9]+' "${URL_FILE}" | sort -u || true)"
-    if [ -n "${FOUND_URLS}" ]; then
-      COUNT="$(printf '%s\n' "${FOUND_URLS}" | grep -c 'http' || true)"
-      echo "OK! Discovered ${COUNT} tunnel endpoint(s)."
-      break
-    fi
-    printf "."; sleep 1
-  done
+    echo "Starting kubectl port-forward to svc/${SVC}:${SERVICE_PORT} (bind 0.0.0.0)..."
+    # Bind to all interfaces so other containers on minikube-net can reach the tunnel.
+    nohup kube-ps2 -n "${NS}" port-forward --address 0.0.0.0 "svc/${SVC}" ":${SERVICE_PORT}" > "${PF_LOG}" 2>&1 &
 
-  if [ -n "${FOUND_URLS}" ]; then
-    for URL in ${FOUND_URLS}; do
-      TUNNEL_PORT="${URL##*:}"
-      [ -n "${TUNNEL_PORT}" ] || continue
-      echo "Preparing Jenkins-side listener on port ${TUNNEL_PORT} for ${URL}"
-      pkill -f "socat TCP-LISTEN:${TUNNEL_PORT}," >/dev/null 2>&1 || true
-      nohup socat TCP-LISTEN:${TUNNEL_PORT},fork,reuseaddr,bind=0.0.0.0 TCP:127.0.0.1:${TUNNEL_PORT} >/dev/null 2>&1 &
+    LOCAL_PORT=""
+    printf "Waiting for port-forward readiness "
+    for i in $(seq 1 60); do
+      # Look for either IPv4 or IPv6 forward messages.
+      LINE="$(grep -Eo 'Forwarding from (0\.0\.0\.0|\[::\]|127\.0\.0\.1):[0-9]+' "${PF_LOG}" | tail -n1 || true)"
+      if [ -n "${LINE}" ]; then
+        LOCAL_PORT="$(printf '%s\n' "${LINE}" | awk -F: '{print $NF}')"
+        [ -n "${LOCAL_PORT}" ] || LOCAL_PORT=""
+      fi
+      if [ -n "${LOCAL_PORT}" ]; then
+        echo "OK (port ${LOCAL_PORT})"
+        break
+      fi
+      printf "."; sleep 1
+    done
+
+    if [ -z "${LOCAL_PORT}" ]; then
+      echo "TIMEOUT waiting for port-forward. Recent log output:"
+      tail -n 20 "${PF_LOG}" || true
+      echo "WARN: Port-forward never became ready."
+      pkill -f "port-forward.*svc/${SVC}" >/dev/null 2>&1 || true
+    else
+      # Allow a brief moment for the port to settle.
       sleep 1
-
       set +e
-      HOST_PORT="$(publish_and_verify "${TUNNEL_PORT}" "${JENKINS_HOST_TARGETS}" "${TUNNEL_PORT}" "expose-${SVC}-via-url-${TUNNEL_PORT}" "${MK_NET}")"
+      HOST_PORT="$(publish_and_verify "${LOCAL_PORT}" "${JENKINS_HOST_TARGETS}" "${LOCAL_PORT}" "expose-${SVC}-via-url-${LOCAL_PORT}" "${MK_NET}")"
       STATUS=$?
       set -e
 
       if [ -n "${HOST_PORT}" ]; then
-        add_success "http://127.0.0.1:${HOST_PORT}" "minikube service ${URL}"
+        add_success "http://127.0.0.1:${HOST_PORT}" "kubectl port-forward svc/${SVC}:${SERVICE_PORT} -> pod"
         if [ "${STATUS}" -ne 0 ]; then
           echo "WARN: host.docker.internal check for ${HOST_PORT} failed. Try the URL manually."
         fi
       fi
-    done
-  else
-    echo "WARN: No tunnels discovered from 'minikube service --url'."
+    fi
   fi
 else
-  echo "Skipping 'minikube service --url' exposure (mode=${MODE})."
+  echo "Skipping service-url exposure (mode=${MODE})."
 fi
 
 if [ "${SUCCESS_COUNT}" -gt 0 ]; then
