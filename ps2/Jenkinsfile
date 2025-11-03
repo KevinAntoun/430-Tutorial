@@ -48,7 +48,7 @@ pipeline {
             chmod +x /usr/local/bin/kubectl
           fi
           apt-get update -y
-          # ADDED: jq for robust JSON parsing
+          # jq for robust JSON parsing; socat for port bridging; procps for ss
           apt-get install -y --no-install-recommends iproute2 socat curl ca-certificates procps jq
           mkdir -p "${MINIKUBE_HOME}" "$(dirname "${KUBECONFIG}")"
         '''
@@ -59,7 +59,7 @@ pipeline {
       steps {
         sh '''
           set -euo pipefail
-          if ! docker network inspect "${MK_DOCKER_NET}" >/dev.null 2>&1; then
+          if ! docker network inspect "${MK_DOCKER_NET}" >/dev/null 2>&1; then
             docker network create --driver=bridge --subnet="${MK_SUBNET}" "${MK_DOCKER_NET}"
           fi
         '''
@@ -281,7 +281,7 @@ echo "Bridge stopped"
 EOS
           chmod +x /usr/local/bin/stop-ps2-bridge
 
-          # expose-django-service (NodePort targeting + port-forward fallback, using jq)
+          # expose-django-service (wait for endpoints, then use `minikube service --url`)
           cat > /usr/local/bin/expose-django-service <<'EOS'
 #!/usr/bin/env sh
 set -eu
@@ -290,6 +290,8 @@ NS="${1:-default}"
 SVC="${2:-django-service}"
 : "${MK_DOCKER_NET:=minikube-net}"
 : "${PS2_AGENT_CONTAINER_ID:=}"
+: "${EXPOSE_WAIT_READY:=120}"   # seconds to wait for endpoints before trying minikube
+: "${EXPOSE_URL_TIMEOUT:=180}"  # max seconds to let `minikube service --url` run
 
 fail() { echo "ERROR: $*" >&2; exit 1; }
 log()  { echo "[expose] $*"; }
@@ -332,48 +334,45 @@ fi
 SELF_IP="$(docker inspect -f '{{with index .NetworkSettings.Networks "'"${MK_DOCKER_NET}"'"}}{{.IPAddress}}{{end}}' "${SELF_ID}" 2>/dev/null || true)"
 [ -n "${SELF_IP}" ] || fail "Container ${SELF_ID} has no IP on ${MK_DOCKER_NET}"
 
-TYPE="$(kube-ps2 -n "${NS}" get svc "${SVC}" -o jsonpath='{.spec.type}')"
-
-# Robust port map via jq: lines of "servicePort:nodePort" (nodePort empty if not applicable)
-PORTMAP="$(
-  kube-ps2 -n "${NS}" get svc "${SVC}" -o json \
-  | jq -r '.spec.ports[] | (.port|tostring)+":" + ((.nodePort // "")|tostring)'
-)"
-
-NODE_IP="$(mk-ps2 ip)"
-
-get_nodeport_for() {
-  svc_port="$1"
-  echo "$PORTMAP" | awk -f: -v p="$svc_port" '$1==p && $2!="" {print $2; exit}'
-}
-
-ensure_pf_for() {
-  local local_p="$1" target_p="$2"
-  if ! ss -ltn 2>/dev/null | awk '{print $4}' | grep -q ":$local_p$"; then
-    nohup kube-ps2 -n "${NS}" port-forward "svc/${SVC}" --address=0.0.0.0 "${local_p}:${target_p}" >/tmp/pf-"${SVC}"-"${local_p}".log 2>&1 &
-    for i in $(seq 1 60); do ss -ltn 2>/dev/null | awk '{print $4}' | grep -q ":$local_p$" && break || sleep 0.2; done
+# --- wait for endpoints (minikube blocks if none)
+log "Waiting (up to ${EXPOSE_WAIT_READY}s) for ${NS}/${SVC} endpoints to be ready…"
+end_deadline=$(( $(date +%s) + EXPOSE_WAIT_READY ))
+ready="no"
+while :; do
+  if kube-ps2 -n "${NS}" get endpoints "${SVC}" -o json | jq -e '.subsets | length > 0 and ([.subsets[].addresses // []] | add | length) > 0' >/dev/null; then
+    ready="yes"; break
   fi
-}
+  [ "$(date +%s)" -ge "${end_deadline}" ] && break
+  sleep 1
+done
+[ "${ready}" = "yes" ] || log "No ready endpoints yet; will still try minikube (it may take longer to print URLs)."
 
-log "Fetching service URLs via minikube (timeout 120s)..."
+# --- call `minikube service --url` and keep whatever it prints
+log "Fetching service URLs via minikube (timeout ${EXPOSE_URL_TIMEOUT}s)..."
 set +e
-MK_URLS_RAW="$(timeout 120 mk-ps2 service -n "${NS}" "${SVC}" --url 2>&1)"
+MK_URLS_RAW="$(timeout "${EXPOSE_URL_TIMEOUT}" mk-ps2 service -n "${NS}" "${SVC}" --url --format='{{.URL}}' 2>&1)"
 MK_STATUS=$?
 set -e
+
 RAW_URLS="$(printf '%s\n' "${MK_URLS_RAW}" | tr -d '\r')"
 URL_LINES="$(printf '%s\n' "${RAW_URLS}" | awk 'index($0,"://")')"
 
 if [ "${MK_STATUS}" -ne 0 ]; then
   stripped="$(printf '%s' "${URL_LINES}" | tr -d '\n')"
   if [ "${MK_STATUS}" -eq 124 ] && [ -n "${stripped}" ]; then
-    log "minikube service --url timed out after emitting URLs; continuing with captured output."
+    log "minikube timed out but emitted URLs; continuing."
   else
     printf '%s\n' "${MK_URLS_RAW}" >&2
-    fail "minikube service --url failed (exit ${MK_STATUS}); ensure the cluster and service are healthy."
+    fail "minikube service --url failed (exit ${MK_STATUS}); ensure the service has endpoints."
   fi
 fi
+
 [ -n "$(printf '%s' "${URL_LINES}" | tr -d '\n')" ] || { printf '%s\n' "${RAW_URLS}" >&2; fail "minikube service --url returned no URLs for ${NS}/${SVC}"; }
 
+log "minikube reported the following URLs:"
+printf '%s\n' "${URL_LINES}"
+
+# --- proxy each URL to a Windows-friendly localhost port
 log "Removing stale proxy containers for ${SVC}"
 OLD_IFS="${IFS}"; IFS='
 '
@@ -381,9 +380,6 @@ for cid in $(docker ps -a --filter "label=com.ps2.expose.service=${SVC}" --forma
   [ -n "${cid}" ] && docker rm -f "${cid}" >/dev/null 2>&1 || true
 done
 IFS="${OLD_IFS}"
-
-log "minikube reported the following URLs:"
-printf '%s\n' "${URL_LINES}"
 
 COUNT=0
 WIN_URLS=""
@@ -402,29 +398,8 @@ while IFS= read -r url; do
   [ -n "${host}" ] || fail "Could not parse host from URL: ${url}"
   [ -n "${port}" ] || fail "Could not parse port from URL: ${url}"
 
-  svc_port="${port}"  # servicePort typically equals URL port
-
-  TARGET_HOST=""; TARGET_PORT=""
-  if [ "${host}" = "127.0.0.1" ] || [ "${host}" = "localhost" ]; then
-    if [ "${TYPE}" = "NodePort" ]; then
-      node_p="$(get_nodeport_for "${svc_port}")"
-      if [ -n "${node_p}" ]; then
-        TARGET_HOST="${NODE_IP}"
-        TARGET_PORT="${node_p}"
-      else
-        TARGET_HOST="${SELF_IP}"
-        TARGET_PORT="${svc_port}"
-        ensure_pf_for "${TARGET_PORT}" "${svc_port}"
-      fi
-    else
-      TARGET_HOST="${SELF_IP}"
-      TARGET_PORT="${svc_port}"
-      ensure_pf_for "${TARGET_PORT}" "${svc_port}"
-    fi
-  else
-    TARGET_HOST="${host}"
-    TARGET_PORT="${port}"
-  fi
+  TARGET_HOST="${host}"
+  TARGET_PORT="${port}"
 
   proxy_name="$(printf 'expose-%s-%s-%s' "${SVC}" "${proto}" "${TARGET_PORT}")"
   docker rm -f "${proxy_name}" >/dev/null 2>&1 || true
