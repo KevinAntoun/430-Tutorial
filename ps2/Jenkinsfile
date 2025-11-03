@@ -292,6 +292,7 @@ EOS
 set -eu
 NS="${1:-default}"
 SVC="${2:-django-service}"
+MODE="${3:-all}"
 JENKINS_DEFAULT_ALIAS="jenkins"
 MK_NET="${MK_DOCKER_NET:-minikube-net}"
 
@@ -320,6 +321,21 @@ kube-ps2 -n "${NS}" get svc "${SVC}" >/dev/null 2>&1 || fail "Service ${NS}/${SV
 SUCCESS_COUNT=0
 WINDOWS_URLS=""
 SUCCESS_DETAILS=""
+
+DO_NODEPORT=1
+DO_SERVICE=1
+case "${MODE}" in
+  ""|all) ;;
+  service-url-only|--service-url-only)
+    DO_NODEPORT=0
+    ;;
+  nodeport-only|--nodeport-only)
+    DO_SERVICE=0
+    ;;
+  *)
+    echo "WARN: Unrecognized mode '${MODE}'. Expected '--service-url-only' or '--nodeport-only'." >&2
+    ;;
+esac
 
 # Determine useful aliases for the Jenkins container so helper proxies can reach it.
 JENKINS_ID="$(hostname)"
@@ -386,69 +402,77 @@ publish_and_verify() {
 }
 
 # --- Method B (Preferred): expose the NodePort directly through Docker Desktop ---
-echo "Attempting Method B: Exposing via NodePort..."
-NODE_PORT="$(kube-ps2 -n "${NS}" get svc "${SVC}" -o jsonpath='{.spec.ports[0].nodePort}' 2>/dev/null || true)"
-MINIKUBE_IP="$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' minikube 2>/dev/null || true)"
+if [ "${DO_NODEPORT}" -eq 1 ]; then
+  echo "Attempting Method B: Exposing via NodePort..."
+  NODE_PORT="$(kube-ps2 -n "${NS}" get svc "${SVC}" -o jsonpath='{.spec.ports[0].nodePort}' 2>/dev/null || true)"
+  MINIKUBE_IP="$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' minikube 2>/dev/null || true)"
 
-if [ -n "${NODE_PORT}" ] && [ -n "${MINIKUBE_IP}" ]; then
-  echo "Found NodePort ${NODE_PORT} and Minikube IP ${MINIKUBE_IP}"
-  set +e
-  HOST_PORT="$(publish_and_verify "${NODE_PORT}" "minikube ${MINIKUBE_IP}" "${NODE_PORT}" "expose-${SVC}-via-nodeport" "${MK_NET}")"
-  STATUS=$?
-  set -e
-  if [ -n "${HOST_PORT}" ]; then
-    add_success "http://127.0.0.1:${HOST_PORT}" "NodePort bridge -> minikube:${NODE_PORT}"
-    if [ "${STATUS}" -ne 0 ]; then
-      echo "WARN: Automatic verification of NodePort forwarding had warnings. Try the URL manually."
+  if [ -n "${NODE_PORT}" ] && [ -n "${MINIKUBE_IP}" ]; then
+    echo "Found NodePort ${NODE_PORT} and Minikube IP ${MINIKUBE_IP}"
+    set +e
+    HOST_PORT="$(publish_and_verify "${NODE_PORT}" "minikube ${MINIKUBE_IP}" "${NODE_PORT}" "expose-${SVC}-via-nodeport" "${MK_NET}")"
+    STATUS=$?
+    set -e
+    if [ -n "${HOST_PORT}" ]; then
+      add_success "http://127.0.0.1:${HOST_PORT}" "NodePort bridge -> minikube:${NODE_PORT}"
+      if [ "${STATUS}" -ne 0 ]; then
+        echo "WARN: Automatic verification of NodePort forwarding had warnings. Try the URL manually."
+      fi
     fi
+  else
+    echo "Could not determine NodePort or Minikube IP. Skipping Method B."
   fi
 else
-  echo "Could not determine NodePort or Minikube IP. Skipping Method B."
+  echo "Skipping NodePort exposure (mode=${MODE})."
 fi
 
 # --- Method A: run 'minikube service --url' and surface every discovered tunnel ---
-echo ""
-echo "Attempting Method A: Exposing via 'minikube service --url'..."
-URL_FILE="/tmp/${SVC}.url"; : > "${URL_FILE}"
-pkill -f "minikube.*service.*${SVC}.*--url" >/dev/null 2>&1 || true
+if [ "${DO_SERVICE}" -eq 1 ]; then
+  echo ""
+  echo "Attempting Method A: Exposing via 'minikube service --url'..."
+  URL_FILE="/tmp/${SVC}.url"; : > "${URL_FILE}"
+  pkill -f "minikube.*service.*${SVC}.*--url" >/dev/null 2>&1 || true
 
-nohup mk-ps2 service -n "${NS}" "${SVC}" --url > "${URL_FILE}" 2>&1 &
+  nohup mk-ps2 service -n "${NS}" "${SVC}" --url > "${URL_FILE}" 2>&1 &
 
-FOUND_URLS=""
-printf "Waiting for 'minikube service --url' tunnel "
-for i in $(seq 1 60); do
-  FOUND_URLS="$(grep -Eo 'http://127\\.0\\.0\\.1:[0-9]+' "${URL_FILE}" | sort -u || true)"
-  if [ -n "${FOUND_URLS}" ]; then
-    COUNT="$(printf '%s\n' "${FOUND_URLS}" | grep -c 'http' || true)"
-    echo "OK! Discovered ${COUNT} tunnel endpoint(s)."
-    break
-  fi
-  printf "."; sleep 1
-done
-
-if [ -n "${FOUND_URLS}" ]; then
-  for URL in ${FOUND_URLS}; do
-    TUNNEL_PORT="${URL##*:}"
-    [ -n "${TUNNEL_PORT}" ] || continue
-    echo "Preparing Jenkins-side listener on port ${TUNNEL_PORT} for ${URL}"
-    pkill -f "socat TCP-LISTEN:${TUNNEL_PORT}," >/dev/null 2>&1 || true
-    nohup socat TCP-LISTEN:${TUNNEL_PORT},fork,reuseaddr,bind=0.0.0.0 TCP:127.0.0.1:${TUNNEL_PORT} >/dev/null 2>&1 &
-    sleep 1
-
-    set +e
-    HOST_PORT="$(publish_and_verify "${TUNNEL_PORT}" "${JENKINS_HOST_TARGETS}" "${TUNNEL_PORT}" "expose-${SVC}-via-url-${TUNNEL_PORT}" "${MK_NET}")"
-    STATUS=$?
-    set -e
-
-    if [ -n "${HOST_PORT}" ]; then
-      add_success "http://127.0.0.1:${HOST_PORT}" "minikube service ${URL}"
-      if [ "${STATUS}" -ne 0 ]; then
-        echo "WARN: host.docker.internal check for ${HOST_PORT} failed. Try the URL manually."
-      fi
+  FOUND_URLS=""
+  printf "Waiting for 'minikube service --url' tunnel "
+  for i in $(seq 1 60); do
+    FOUND_URLS="$(grep -Eo 'http://127\\.0\\.0\\.1:[0-9]+' "${URL_FILE}" | sort -u || true)"
+    if [ -n "${FOUND_URLS}" ]; then
+      COUNT="$(printf '%s\n' "${FOUND_URLS}" | grep -c 'http' || true)"
+      echo "OK! Discovered ${COUNT} tunnel endpoint(s)."
+      break
     fi
+    printf "."; sleep 1
   done
+
+  if [ -n "${FOUND_URLS}" ]; then
+    for URL in ${FOUND_URLS}; do
+      TUNNEL_PORT="${URL##*:}"
+      [ -n "${TUNNEL_PORT}" ] || continue
+      echo "Preparing Jenkins-side listener on port ${TUNNEL_PORT} for ${URL}"
+      pkill -f "socat TCP-LISTEN:${TUNNEL_PORT}," >/dev/null 2>&1 || true
+      nohup socat TCP-LISTEN:${TUNNEL_PORT},fork,reuseaddr,bind=0.0.0.0 TCP:127.0.0.1:${TUNNEL_PORT} >/dev/null 2>&1 &
+      sleep 1
+
+      set +e
+      HOST_PORT="$(publish_and_verify "${TUNNEL_PORT}" "${JENKINS_HOST_TARGETS}" "${TUNNEL_PORT}" "expose-${SVC}-via-url-${TUNNEL_PORT}" "${MK_NET}")"
+      STATUS=$?
+      set -e
+
+      if [ -n "${HOST_PORT}" ]; then
+        add_success "http://127.0.0.1:${HOST_PORT}" "minikube service ${URL}"
+        if [ "${STATUS}" -ne 0 ]; then
+          echo "WARN: host.docker.internal check for ${HOST_PORT} failed. Try the URL manually."
+        fi
+      fi
+    done
+  else
+    echo "WARN: No tunnels discovered from 'minikube service --url'."
+  fi
 else
-  echo "WARN: No tunnels discovered from 'minikube service --url'."
+  echo "Skipping 'minikube service --url' exposure (mode=${MODE})."
 fi
 
 if [ "${SUCCESS_COUNT}" -gt 0 ]; then
