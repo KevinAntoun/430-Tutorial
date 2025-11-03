@@ -314,7 +314,12 @@ if [ -z "${SELF_IP}" ]; then
 fi
 [ -n "${SELF_IP}" ] || fail "Container ${SELF_ID} has no IP on ${MK_DOCKER_NET}; connect it manually."
 
-if ! MK_URLS_RAW="$(mk-ps2 service -n "${NS}" "${SVC}" --url --format '{{range .}}{{println .URL}}{{end}}')" ; then
+set +e
+MK_URLS_RAW="$(mk-ps2 service -n "${NS}" "${SVC}" --url 2>&1)"
+MK_STATUS=$?
+set -e
+if [ "${MK_STATUS}" -ne 0 ]; then
+  printf '%s\n' "${MK_URLS_RAW}" >&2
   fail "minikube service --url failed; ensure the cluster and service are healthy."
 fi
 RAW_URLS="$(printf '%s\n' "${MK_URLS_RAW}" | tr -d '\r')"
