@@ -59,7 +59,7 @@ pipeline {
       steps {
         sh '''
           set -euo pipefail
-          if ! docker network inspect "${MK_DOCKER_NET}" >/dev/null 2>&1; then
+          if ! docker network inspect "${MK_DOCKER_NET}" >/dev.null 2>&1; then
             docker network create --driver=bridge --subnet="${MK_SUBNET}" "${MK_DOCKER_NET}"
           fi
         '''
@@ -337,14 +337,14 @@ TYPE="$(kube-ps2 -n "${NS}" get svc "${SVC}" -o jsonpath='{.spec.type}')"
 # Robust port map via jq: lines of "servicePort:nodePort" (nodePort empty if not applicable)
 PORTMAP="$(
   kube-ps2 -n "${NS}" get svc "${SVC}" -o json \
-  | jq -r '.spec.ports[] | "\(.port):\(.nodePort // "")"'
+  | jq -r '.spec.ports[] | (.port|tostring)+":" + ((.nodePort // "")|tostring)'
 )"
 
 NODE_IP="$(mk-ps2 ip)"
 
 get_nodeport_for() {
   svc_port="$1"
-  echo "$PORTMAP" | awk -F: -v p="$svc_port" '$1==p && $2!="" {print $2; exit}'
+  echo "$PORTMAP" | awk -f: -v p="$svc_port" '$1==p && $2!="" {print $2; exit}'
 }
 
 ensure_pf_for() {
