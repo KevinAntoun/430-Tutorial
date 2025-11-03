@@ -314,8 +314,6 @@ if [ -z "${SELF_IP}" ]; then
 fi
 [ -n "${SELF_IP}" ] || fail "Container ${SELF_ID} has no IP on ${MK_DOCKER_NET}; connect it manually."
 
-set +e
-MK_URLS_RAW="$(mk-ps2 service -n "${NS}" "${SVC}" --url 2>&1)"
 log "Fetching service URLs via minikube (timeout 120s)..."
 set +e
 MK_URLS_RAW="$(timeout 120 mk-ps2 service -n "${NS}" "${SVC}" --url 2>&1)"
