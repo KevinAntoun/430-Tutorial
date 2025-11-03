@@ -370,16 +370,19 @@ set +e
 MK_URLS_RAW="$(timeout 120 mk-ps2 service -n "${NS}" "${SVC}" --url 2>&1)"
 MK_STATUS=$?
 set -e
-if [ "${MK_STATUS}" -ne 0 ]; then
-  printf '%s\n' "${MK_URLS_RAW}" >&2
-  if [ "${MK_STATUS}" -eq 124 ]; then
-    fail "Timed out waiting for minikube to expose ${NS}/${SVC}; check pod readiness and NodePort."
-  fi
-  fail "minikube service --url failed; ensure the cluster and service are healthy."
-fi
 RAW_URLS="$(printf '%s\n' "${MK_URLS_RAW}" | tr -d '\r')"
-
-if [ -z "$(printf '%s' "${RAW_URLS}" | tr -d '\n')" ]; then
+URL_LINES="$(printf '%s\n' "${RAW_URLS}" | awk 'index($0,"://")')"
+if [ "${MK_STATUS}" -ne 0 ]; then
+  stripped="$(printf '%s' "${URL_LINES}" | tr -d '\n')"
+  if [ "${MK_STATUS}" -eq 124 ] && [ -n "${stripped}" ]; then
+    log "minikube service --url timed out after emitting URLs; continuing with captured output."
+  else
+    printf '%s\n' "${MK_URLS_RAW}" >&2
+    fail "minikube service --url failed (exit ${MK_STATUS}); ensure the cluster and service are healthy."
+  fi
+fi
+if [ -z "$(printf '%s' "${URL_LINES}" | tr -d '\n')" ]; then
+  printf '%s\n' "${RAW_URLS}" >&2
   fail "minikube service --url returned no URLs for ${NS}/${SVC}"
 fi
 
@@ -394,7 +397,7 @@ done
 IFS="${OLD_IFS}"
 
 log "minikube reported the following URLs:"
-printf '%s\n' "${RAW_URLS}"
+printf '%s\n' "${URL_LINES}"
 
 COUNT=0
 WIN_URLS=""
@@ -451,7 +454,7 @@ while IFS= read -r url; do
   WIN_URLS="${WIN_URLS}${windows_url}\n"
   log "Mapped ${url} -> ${windows_url} (proxy ${proxy_name})"
 done <<EOF
-${RAW_URLS}
+${URL_LINES}
 EOF
 
 [ "${COUNT}" -gt 0 ] || fail "minikube service --url produced no usable entries"
