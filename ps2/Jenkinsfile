@@ -292,7 +292,7 @@ EOS
 set -eu
 NS="${1:-default}"
 SVC="${2:-django-service}"
-MODE="${3:-all}"
+MODE="${3:-service-url-only}"
 JENKINS_DEFAULT_ALIAS="jenkins"
 MK_NET="${MK_DOCKER_NET:-minikube-net}"
 
@@ -333,7 +333,7 @@ case "${MODE}" in
     DO_SERVICE=0
     ;;
   *)
-    echo "WARN: Unrecognized mode '${MODE}'. Expected '--service-url-only' or '--nodeport-only'." >&2
+    echo "WARN: Unrecognized mode '${MODE}'. Expected 'all', '--service-url-only', or '--nodeport-only'." >&2
     ;;
 esac
 
