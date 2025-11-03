@@ -297,12 +297,20 @@ MK_NET="${MK_DOCKER_NET:-minikube-net}"
 
 fail() { echo "ERROR: $*" >&2; exit 1; }
 add_success() {
+  WIN_URL="$1"
+  DETAIL="$2"
   SUCCESS_COUNT=$((SUCCESS_COUNT + 1))
-  if [ -z "${SUCCESS_MESSAGES}" ]; then
-    SUCCESS_MESSAGES="$1"
+  if [ -z "${WINDOWS_URLS}" ]; then
+    WINDOWS_URLS="${WIN_URL}"
   else
-    SUCCESS_MESSAGES="${SUCCESS_MESSAGES}
-$1"
+    WINDOWS_URLS="${WINDOWS_URLS}
+${WIN_URL}"
+  fi
+  if [ -z "${SUCCESS_DETAILS}" ]; then
+    SUCCESS_DETAILS="${WIN_URL}    ${DETAIL}"
+  else
+    SUCCESS_DETAILS="${SUCCESS_DETAILS}
+${WIN_URL}    ${DETAIL}"
   fi
 }
 
@@ -310,7 +318,8 @@ $1"
 kube-ps2 -n "${NS}" get svc "${SVC}" >/dev/null 2>&1 || fail "Service ${NS}/${SVC} not found"
 
 SUCCESS_COUNT=0
-SUCCESS_MESSAGES=""
+WINDOWS_URLS=""
+SUCCESS_DETAILS=""
 
 # Determine useful aliases for the Jenkins container so helper proxies can reach it.
 JENKINS_ID="$(hostname)"
@@ -388,7 +397,7 @@ if [ -n "${NODE_PORT}" ] && [ -n "${MINIKUBE_IP}" ]; then
   STATUS=$?
   set -e
   if [ -n "${HOST_PORT}" ]; then
-    add_success "NodePort  ->  http://127.0.0.1:${HOST_PORT}  (bridges to minikube:${NODE_PORT})"
+    add_success "http://127.0.0.1:${HOST_PORT}" "NodePort bridge -> minikube:${NODE_PORT}"
     if [ "${STATUS}" -ne 0 ]; then
       echo "WARN: Automatic verification of NodePort forwarding had warnings. Try the URL manually."
     fi
@@ -427,12 +436,12 @@ if [ -n "${FOUND_URLS}" ]; then
     sleep 1
 
     set +e
-    HOST_PORT="$(publish_and_verify "" "${JENKINS_HOST_TARGETS}" "${TUNNEL_PORT}" "expose-${SVC}-via-url-${TUNNEL_PORT}" "${MK_NET}")"
+    HOST_PORT="$(publish_and_verify "${TUNNEL_PORT}" "${JENKINS_HOST_TARGETS}" "${TUNNEL_PORT}" "expose-${SVC}-via-url-${TUNNEL_PORT}" "${MK_NET}")"
     STATUS=$?
     set -e
 
     if [ -n "${HOST_PORT}" ]; then
-      add_success "'minikube service --url' (port ${TUNNEL_PORT})  ->  http://127.0.0.1:${HOST_PORT}"
+      add_success "http://127.0.0.1:${HOST_PORT}" "minikube service ${URL}"
       if [ "${STATUS}" -ne 0 ]; then
         echo "WARN: host.docker.internal check for ${HOST_PORT} failed. Try the URL manually."
       fi
@@ -444,9 +453,12 @@ fi
 
 if [ "${SUCCESS_COUNT}" -gt 0 ]; then
   echo ""
-  echo "--- WINDOWS-FRIENDLY URLS ---"
-  printf '%s\n' "${SUCCESS_MESSAGES}"
-  echo "-----------------------------"
+  echo "--- WINDOWS URLS (copy/paste) ---"
+  printf '%s\n' "${WINDOWS_URLS}"
+  echo ""
+  echo "--- Details ---"
+  printf '%s\n' "${SUCCESS_DETAILS}"
+  echo "-------------------------------"
   exit 0
 fi
 
