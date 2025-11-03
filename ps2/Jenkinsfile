@@ -276,135 +276,129 @@ echo "Bridge stopped"
 EOS
           chmod +x /usr/local/bin/stop-ps2-bridge
 
-          # expose-django-service (ROBUST AND CORRECTED VERSION)
+          # expose-django-service (minikube url helper for Windows)
           cat > /usr/local/bin/expose-django-service <<'EOS'
 #!/usr/bin/env sh
 set -eu
 NS="${1:-default}"
 SVC="${2:-django-service}"
-# This script assumes the Jenkins container can be reached on the docker network with the hostname 'jenkins'.
-# You may need to change this if your Jenkins container has a different network alias or name.
-JENKINS_CONTAINER_HOSTNAME="jenkins"
+: "${MK_DOCKER_NET:=minikube-net}"
 
-# Environment variables are inherited from the parent Jenkins pipeline
-# MK_DOCKER_NET is expected to be 'minikube-net'
-
-fail() { echo "ERROR: $*" >&2; exit 1; }
-
-# Verify service exists before proceeding
-kube-ps2 -n "${NS}" get svc "${SVC}" >/dev/null 2>&1 || fail "Service ${NS}/${SVC} not found"
-
-# Helper to publish a port from the host to a target inside the Docker network
-publish_and_verify() {
-  HOST_PORT_ARG="$1"   # Desired host port (e.g., 8080 or empty for random)
-  TARGET_HOST="$2"     # Target hostname or IP inside Docker (e.g., minikube's IP or 'jenkins')
-  TARGET_PORT="$3"     # Target port
-  PROXY_NAME="$4"      # Name for the proxy container
-  PROXY_NETWORK="$5"   # Docker network for the proxy container
-
-  docker rm -f "${PROXY_NAME}" >/dev/null 2>&1 || true
-
-  PUB_ARG="-p 127.0.0.1:${HOST_PORT_ARG}:${TARGET_PORT}"
-  # If host port is empty, let Docker pick a random one
-  if [ -z "${HOST_PORT_ARG}" ]; then
-    PUB_ARG="-p 127.0.0.1::${TARGET_PORT}"
-  fi
-
-  echo "Starting proxy container '${PROXY_NAME}' on network '${PROXY_NETWORK}'..."
-  echo "Forwarding from host to -> ${TARGET_HOST}:${TARGET_PORT}"
-
-  if ! docker run -d --name "${PROXY_NAME}" --restart unless-stopped \
-       --network "${PROXY_NETWORK}" ${PUB_ARG} \
-       alpine/socat \
-       TCP-LISTEN:${TARGET_PORT},fork,reuseaddr,bind=0.0.0.0 tcp:${TARGET_HOST}:${TARGET_PORT}; then
-    fail "Proxy container '${PROXY_NAME}' failed to start."
-  fi
-
-  # Determine the port Docker assigned on the host
-  EFFECTIVE_HOST_PORT="$(docker port "${PROXY_NAME}" "${TARGET_PORT}/tcp" | awk -F':' '{print $NF}' | tail -n1)"
-  [ -n "${EFFECTIVE_HOST_PORT}" ] || fail "Could not determine published host port for ${PROXY_NAME}"
-
-  echo "Proxy is running. Verifying end-to-end connectivity to http://host.docker.internal:${EFFECTIVE_HOST_PORT}/"
-  # Use a temporary container on the default bridge network to test the connection via the host
-  if docker run --rm --network bridge alpine/curl -sS --max-time 5 "http://host.docker.internal:${EFFECTIVE_HOST_PORT}/" >/dev/null 2>&1; then
-    echo "Verification successful!"
-    echo "${EFFECTIVE_HOST_PORT}" # Return the successful port
-    return 0
-  fi
-
-  echo "WARN: Verification failed. The port may still be accessible from your Windows browser."
-  echo "WARN: This can happen due to firewall rules or Docker networking complexities."
-  echo "${EFFECTIVE_HOST_PORT}" # Return the port anyway, but with a warning
-  return 1
+fail() {
+  echo "ERROR: $*" >&2
+  exit 1
 }
 
-# --- Method B (Preferred): NodePort directly via minikube container IP ---
-echo "Attempting Method B: Exposing via NodePort (more reliable)..."
-NODE_PORT="$(kube-ps2 -n "${NS}" get svc "${SVC}" -o jsonpath='{.spec.ports[0].nodePort}' 2>/dev/null || true)"
-MINIKUBE_IP="$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' minikube 2>/dev/null || true)"
+log() {
+  echo "[expose] $*"
+}
 
-if [ -n "${NODE_PORT}" ] && [ -n "${MINIKUBE_IP}" ]; then
-  echo "Found NodePort ${NODE_PORT} and Minikube IP ${MINIKUBE_IP}"
-  HOST_PORT=$(publish_and_verify "${NODE_PORT}" "${MINIKUBE_IP}" "${NODE_PORT}" "expose-${SVC}-via-nodeport" "${MK_DOCKER_NET}")
+kube-ps2 -n "${NS}" get svc "${SVC}" >/dev/null 2>&1 || fail "Service ${NS}/${SVC} not found"
 
-  if [ -n "${HOST_PORT}" ]; then
-    echo ""
-    echo "--- SUCCESS (Method B) ---"
-    echo "Service is exposed via NodePort."
-    echo ">> Open on Windows: http://127.0.0.1:${HOST_PORT}"
-    echo "--------------------------"
-    exit 0
-  fi
-else
-  echo "Could not determine NodePort or Minikube IP. Skipping Method B."
+if ! docker network inspect "${MK_DOCKER_NET}" >/dev/null 2>&1; then
+  fail "Docker network ${MK_DOCKER_NET} not found; run the Jenkins pipeline setup first."
 fi
 
+SELF_ID="$(hostname)"
+[ -n "${SELF_ID}" ] || fail "Could not determine current container id (hostname is empty)"
 
-# --- Method A (Fallback): minikube service --url ---
-echo ""
-echo "Attempting Method A (Fallback): Exposing via 'minikube service --url'..."
-URL_FILE="/tmp/${SVC}.url"; : > "${URL_FILE}"
-# Clean up previous tunnel processes
-pkill -f "minikube.*service.*${SVC}.*--url" >/dev/null 2>&1 || true
+if ! docker inspect "${SELF_ID}" >/dev/null 2>&1; then
+  fail "Unable to inspect container ${SELF_ID}; ensure this job has access to the Docker socket."
+fi
 
-nohup mk-ps2 service -n "${NS}" "${SVC}" --url > "${URL_FILE}" 2>&1 &
+SELF_IP="$(docker inspect -f '{{with index .NetworkSettings.Networks "'"${MK_DOCKER_NET}"'"}}{{.IPAddress}}{{end}}' "${SELF_ID}" 2>/dev/null || true)"
+if [ -z "${SELF_IP}" ]; then
+  log "Attaching current container (${SELF_ID}) to ${MK_DOCKER_NET}"
+  docker network connect "${MK_DOCKER_NET}" "${SELF_ID}" >/dev/null 2>&1 || true
+  SELF_IP="$(docker inspect -f '{{with index .NetworkSettings.Networks "'"${MK_DOCKER_NET}"'"}}{{.IPAddress}}{{end}}' "${SELF_ID}" 2>/dev/null || true)"
+fi
+[ -n "${SELF_IP}" ] || fail "Container ${SELF_ID} has no IP on ${MK_DOCKER_NET}; connect it manually."
 
-printf "Waiting for 'minikube service --url' tunnel "
-TUNNEL_PORT=""
-for i in $(seq 1 60); do
-  LINE="$(grep -Eo 'http://127\\.0\\.0\\.1:[0-9]+' "${URL_FILE}" | head -n1 || true)"
-  if [ -n "${LINE}" ]; then
-    TUNNEL_PORT="$(echo "${LINE}" | awk -F: '{print $3}')"
-    echo "OK! Tunnel is active inside Jenkins on port ${TUNNEL_PORT}"
-    break
-  fi
-  printf "."; sleep 1
+if ! MK_URLS_RAW="$(mk-ps2 service -n "${NS}" "${SVC}" --url --format '{{range .}}{{println .URL}}{{end}}')" ; then
+  fail "minikube service --url failed; ensure the cluster and service are healthy."
+fi
+RAW_URLS="$(printf '%s\n' "${MK_URLS_RAW}" | tr -d '\r')"
+
+if [ -z "$(printf '%s' "${RAW_URLS}" | tr -d '\n')" ]; then
+  fail "minikube service --url returned no URLs for ${NS}/${SVC}"
+fi
+
+log "Removing stale Windows proxy containers for ${SVC}"
+OLD_IFS="${IFS}"
+IFS='
+'
+for cid in $(docker ps -a --filter "label=com.ps2.expose.service=${SVC}" --format '{{.ID}}'); do
+  [ -n "${cid}" ] || continue
+  docker rm -f "${cid}" >/dev/null 2>&1 || true
 done
+IFS="${OLD_IFS}"
 
-if [ -n "${TUNNEL_PORT}" ]; then
-  # Make the tunnel accessible on all of the Jenkins container's network interfaces
-  pkill -f "socat TCP-LISTEN:${TUNNEL_PORT}," >/dev/null 2>&1 || true
-  nohup socat TCP-LISTEN:${TUNNEL_PORT},fork,reuseaddr,bind=0.0.0.0 TCP:127.0.0.1:${TUNNEL_PORT} >/dev/null 2>&1 &
-  sleep 1
+log "minikube reported the following URLs:"
+printf '%s\n' "${RAW_URLS}"
 
-  # Now, publish this port to the host by targeting the Jenkins container itself
-  HOST_PORT=$(publish_and_verify "" "${JENKINS_CONTAINER_HOSTNAME}" "${TUNNEL_PORT}" "expose-${SVC}-via-url" "${MK_DOCKER_NET}")
+COUNT=0
+WIN_URLS=""
 
-  if [ -n "${HOST_PORT}" ]; then
-    echo ""
-    echo "--- SUCCESS (Method A) ---"
-    echo "Service is exposed via 'minikube service --url' tunnel."
-    echo ">> Open on Windows: http://127.0.0.1:${HOST_PORT}"
-    echo "--------------------------"
-    exit 0
+while IFS= read -r url; do
+  [ -n "${url}" ] || continue
+  COUNT=$((COUNT + 1))
+
+  proto_raw="${url%%://*}"
+  if [ "${proto_raw}" = "${url}" ]; then
+    proto_raw="http"
   fi
-fi
+  proto="$(printf '%s' "${proto_raw}" | tr '[:upper:]' '[:lower:]')"
 
-echo ""
-echo "--- FAILURE ---"
-echo "Both exposure methods failed."
-echo "Please check your Docker networking, firewall settings, and the pod logs for errors."
-exit 1
+  rest="${url#*://}"
+  host_port="${rest%%/*}"
+  host="${host_port%%:*}"
+  port="${host_port##*:}"
+  if [ "${host}" = "${port}" ]; then
+    port=""
+  fi
+
+  [ -n "${host}" ] || fail "Could not parse host from URL: ${url}"
+  [ -n "${port}" ] || fail "Could not parse port from URL: ${url}"
+
+  case "${host}" in
+    127.0.0.1|localhost)
+      target_host="${SELF_IP}"
+      ;;
+    *)
+      target_host="${host}"
+      ;;
+  esac
+
+  proxy_name="$(printf 'expose-%s-%s-%s' "${SVC}" "${proto}" "${port}")"
+  docker rm -f "${proxy_name}" >/dev/null 2>&1 || true
+
+  if ! docker run -d --name "${proxy_name}" \
+      --network "${MK_DOCKER_NET}" \
+      --restart unless-stopped \
+      --label com.ps2.expose=1 \
+      --label com.ps2.expose.service="${SVC}" \
+      --label com.ps2.expose.port="${port}" \
+      -p 127.0.0.1::"${port}" \
+      alpine/socat \
+      TCP-LISTEN:"${port}",fork,reuseaddr,bind=0.0.0.0 TCP:"${target_host}":"${port}" >/dev/null 2>&1; then
+    fail "Failed to start proxy container ${proxy_name}"
+  fi
+
+  host_port="$(docker port "${proxy_name}" "${port}/tcp" | awk -F':' 'NF==2 {print $2}' | tail -n1)"
+  [ -n "${host_port}" ] || fail "Could not determine published host port for ${proxy_name}"
+
+  windows_url="$(printf '%s://127.0.0.1:%s' "${proto}" "${host_port}")"
+  WIN_URLS="${WIN_URLS}${windows_url}\n"
+  log "Mapped ${url} -> ${windows_url} (proxy ${proxy_name})"
+done <<EOF
+${RAW_URLS}
+EOF
+
+[ "${COUNT}" -gt 0 ] || fail "minikube service --url produced no usable entries"
+
+printf '\nWindows-friendly URLs now reachable on this machine:\n'
+printf '%b' "${WIN_URLS}"
+printf 'To tear them down later: docker ps --filter "label=com.ps2.expose.service=%s" -q | xargs docker rm -f\n' "${SVC}"
 EOS
           chmod +x /usr/local/bin/expose-django-service
 
