@@ -446,7 +446,7 @@ if [ "${DO_SERVICE}" -eq 1 ]; then
     printf "Waiting for port-forward readiness "
     for i in $(seq 1 60); do
       # Look for either IPv4 or IPv6 forward messages.
-      LINE="$(grep -Eo 'Forwarding from (0\.0\.0\.0|\[::\]|127\.0\.0\.1):[0-9]+' "${PF_LOG}" | tail -n1 || true)"
+      LINE="$(grep -Eo 'Forwarding from [^ ]+:[0-9]+' "${PF_LOG}" | tail -n1 || true)"
       if [ -n "${LINE}" ]; then
         LOCAL_PORT="$(printf '%s\n' "${LINE}" | awk -F: '{print $NF}')"
         [ -n "${LOCAL_PORT}" ] || LOCAL_PORT=""
