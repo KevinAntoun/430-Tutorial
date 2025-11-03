@@ -34,6 +34,10 @@ pipeline {
       steps {
         sh '''
           set -euo pipefail
+          if [ "$(id -u)" -ne 0 ]; then
+            echo "Install CLIs stage requires root privileges; run the Jenkins agent as root."
+            exit 1
+          fi
           if ! command -v minikube >/dev/null 2>&1; then
             curl -fsSL https://storage.googleapis.com/minikube/releases/latest/minikube-linux-amd64 -o /usr/local/bin/minikube
             chmod +x /usr/local/bin/minikube
@@ -44,7 +48,7 @@ pipeline {
             chmod +x /usr/local/bin/kubectl
           fi
           apt-get update -y
-          apt-get install -y --no-install-recommends iproute2 socat curl ca-certificates
+          apt-get install -y --no-install-recommends iproute2 socat curl ca-certificates procps
           mkdir -p "${MINIKUBE_HOME}" "$(dirname "${KUBECONFIG}")"
         '''
       }
@@ -283,6 +287,7 @@ set -eu
 NS="${1:-default}"
 SVC="${2:-django-service}"
 : "${MK_DOCKER_NET:=minikube-net}"
+: "${PS2_AGENT_CONTAINER_ID:=}"
 
 fail() {
   echo "ERROR: $*" >&2
@@ -293,17 +298,63 @@ log() {
   echo "[expose] $*"
 }
 
+resolve_self_container() {
+  set --
+  if [ -n "${PS2_AGENT_CONTAINER_ID}" ]; then
+    set -- "$@" "${PS2_AGENT_CONTAINER_ID}"
+  fi
+  h="$(hostname 2>/dev/null || true)"
+  if [ -n "${h}" ]; then
+    set -- "$@" "${h}"
+  fi
+  if [ -r /proc/self/cgroup ]; then
+    cgroup_guess="$(grep -Eo '[0-9a-f]{64}' /proc/self/cgroup 2>/dev/null | head -n1)"
+    if [ -n "${cgroup_guess}" ]; then
+      set -- "$@" "${cgroup_guess}"
+    fi
+  fi
+  if [ -r /proc/1/cpuset ]; then
+    cpuset_guess="$(awk -F/ 'NF {print $NF}' /proc/1/cpuset 2>/dev/null)"
+    if [ -n "${cpuset_guess}" ]; then
+      set -- "$@" "${cpuset_guess}"
+    fi
+  fi
+  for guess in "$@"; do
+    [ -n "${guess}" ] || continue
+    if docker inspect "${guess}" >/dev/null 2>&1; then
+      docker inspect -f '{{.Id}}' "${guess}" 2>/dev/null && return 0
+    fi
+    cand="$(docker ps --no-trunc --filter "id=${guess}" --format '{{.ID}}' | head -n1)"
+    if [ -n "${cand}" ]; then
+      echo "${cand}"
+      return 0
+    fi
+    cand="$(docker ps --filter "name=${guess}" --format '{{.ID}}' | head -n1)"
+    if [ -n "${cand}" ]; then
+      echo "${cand}"
+      return 0
+    fi
+  done
+  return 1
+}
+
 kube-ps2 -n "${NS}" get svc "${SVC}" >/dev/null 2>&1 || fail "Service ${NS}/${SVC} not found"
 
 if ! docker network inspect "${MK_DOCKER_NET}" >/dev/null 2>&1; then
   fail "Docker network ${MK_DOCKER_NET} not found; run the Jenkins pipeline setup first."
 fi
 
-SELF_ID="$(hostname)"
-[ -n "${SELF_ID}" ] || fail "Could not determine current container id (hostname is empty)"
+SELF_ID="$(resolve_self_container || true)"
+[ -n "${SELF_ID}" ] || fail "Unable to determine the Jenkins container id; set PS2_AGENT_CONTAINER_ID explicitly if this job runs inside Docker."
 
 if ! docker inspect "${SELF_ID}" >/dev/null 2>&1; then
-  fail "Unable to inspect container ${SELF_ID}; ensure this job has access to the Docker socket."
+  fail "Unable to inspect container ${SELF_ID}; ensure Docker access is available and PS2_AGENT_CONTAINER_ID is correct."
+fi
+
+attached="$(docker inspect -f '{{if index .NetworkSettings.Networks "'"${MK_DOCKER_NET}"'"}}yes{{end}}' "${SELF_ID}" 2>/dev/null || true)"
+if [ "${attached}" != "yes" ]; then
+  log "Attaching current container (${SELF_ID}) to ${MK_DOCKER_NET}"
+  docker network connect "${MK_DOCKER_NET}" "${SELF_ID}" >/dev/null 2>&1 || true
 fi
 
 SELF_IP="$(docker inspect -f '{{with index .NetworkSettings.Networks "'"${MK_DOCKER_NET}"'"}}{{.IPAddress}}{{end}}' "${SELF_ID}" 2>/dev/null || true)"
@@ -423,7 +474,7 @@ EOS
           set -euo pipefail
           start-ps2-bridge
           echo "Discovering a Windows-friendly URL for django-service..."
-          expose-django-service default django-service || true
+          expose-django-service default django-service
         '''
       }
     }
