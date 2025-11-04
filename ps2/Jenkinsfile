@@ -298,9 +298,62 @@ MINIKUBE_HOME="${MINIKUBE_HOME:-${MK_ROOT}/.minikube}"
 KUBECONFIG="${KUBECONFIG:-${MK_ROOT}/.kube/config}"
 export MK_ROOT MINIKUBE_HOME KUBECONFIG
 
-NS="${1:-default}"
-SVC="${2:-django-service}"
-MODE="${3:-service-url-only}"
+NS="default"
+SVC="django-service"
+MODE="service-url-only"
+
+KEEP_EXISTING_RAW="${KEEP_EXISTING:-0}"
+# Accept environment overrides like KEEP_EXISTING=true/1 to preserve previous tunnels.
+case "${KEEP_EXISTING_RAW}" in
+  1|true|TRUE|yes|YES|on|ON) KEEP_EXISTING=1 ;;
+  *) KEEP_EXISTING=0 ;;
+esac
+
+POSITIONAL_INDEX=0
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --keep-existing)
+      KEEP_EXISTING=1
+      ;;
+    --replace-existing)
+      KEEP_EXISTING=0
+      ;;
+    --mode=*)
+      MODE="${1#*=}"
+      ;;
+    --mode)
+      if [ "$#" -gt 1 ]; then
+        shift
+        MODE="$1"
+      else
+        echo "WARN: --mode requires a value; keeping default '${MODE}'." >&2
+      fi
+      ;;
+    --service-url-only|--nodeport-only|--all)
+      MODE="${1#--}"
+      ;;
+    -*)
+      echo "WARN: Unrecognized option '$1'." >&2
+      ;;
+    *)
+      case "${POSITIONAL_INDEX}" in
+        0) NS="$1" ;;
+        1) SVC="$1" ;;
+        2) MODE="$1" ;;
+        *)
+          echo "WARN: Extra positional argument '$1' ignored." >&2
+          ;;
+      esac
+      POSITIONAL_INDEX=$((POSITIONAL_INDEX + 1))
+      ;;
+  esac
+  shift
+done
+
+case "${MODE}" in
+  --*) MODE="${MODE#--}" ;;
+esac
+
 JENKINS_DEFAULT_ALIAS="jenkins"
 MK_NET="${MK_DOCKER_NET:-minikube-net}"
 
@@ -334,14 +387,14 @@ DO_NODEPORT=1
 DO_SERVICE=1
 case "${MODE}" in
   ""|all) ;;
-  service-url-only|--service-url-only)
+  service-url-only)
     DO_NODEPORT=0
     ;;
-  nodeport-only|--nodeport-only)
+  nodeport-only)
     DO_SERVICE=0
     ;;
   *)
-    echo "WARN: Unrecognized mode '${MODE}'. Expected 'all', '--service-url-only', or '--nodeport-only'." >&2
+    echo "WARN: Unrecognized mode '${MODE}'. Expected 'all', 'service-url-only', or 'nodeport-only'." >&2
     ;;
 esac
 
@@ -364,7 +417,11 @@ publish_and_verify() {
   PROXY_NAME="$4"       # Name of the long-lived proxy container
   PROXY_NETWORK="$5"    # Network where the proxy should live
 
-  docker rm -f "${PROXY_NAME}" >/dev/null 2>&1 || true
+  if [ "${KEEP_EXISTING}" -eq 1 ]; then
+    PROXY_NAME="${PROXY_NAME}.$(date +%s%N)"
+  else
+    docker rm -f "${PROXY_NAME}" >/dev/null 2>&1 || true
+  fi
 
   PUB_ARG="-p 127.0.0.1:${HOST_PORT_ARG}:${TARGET_PORT}"
   if [ -z "${HOST_PORT_ARG}" ]; then
@@ -443,13 +500,24 @@ if [ "${DO_SERVICE}" -eq 1 ]; then
   if [ -z "${SERVICE_PORT}" ]; then
     echo "WARN: Could not determine service port for ${NS}/${SVC}. Skipping Method A."
   else
-    PF_LOG="/tmp/${NS}-${SVC}.port-forward.log"; : > "${PF_LOG}"
-    pkill -f "port-forward.*svc/${SVC}" >/dev/null 2>&1 || true
+    if [ "${KEEP_EXISTING}" -eq 1 ]; then
+      UNIQUE_ID="$(date +%s%N)"
+      PF_SUFFIX=".${UNIQUE_ID}"
+    else
+      UNIQUE_ID=""
+      PF_SUFFIX=""
+    fi
+
+    PF_LOG="/tmp/${NS}-${SVC}${PF_SUFFIX}.port-forward.log"; : > "${PF_LOG}"
+
+    if [ "${KEEP_EXISTING}" -ne 1 ]; then
+      pkill -f "port-forward.*svc/${SVC}" >/dev/null 2>&1 || true
+    fi
 
     echo "Starting kubectl port-forward to svc/${SVC}:${SERVICE_PORT} (detached via docker exec)..."
     # Run port-forward inside the Jenkins container via docker exec so it survives shell cleanup.
     PORT_FORWARD_STARTED=0
-    PF_WRAPPER="/tmp/expose-${NS}-${SVC}.port-forward.sh"
+    PF_WRAPPER="/tmp/expose-${NS}-${SVC}${PF_SUFFIX}.port-forward.sh"
     cat > "${PF_WRAPPER}" <<EOF
 #!/usr/bin/env sh
 set -eu
