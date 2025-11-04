@@ -290,6 +290,14 @@ EOS
           cat > /usr/local/bin/expose-django-service <<'EOS'
 #!/usr/bin/env sh
 set -eu
+
+# Provide sane defaults when run outside the Jenkins pipeline (e.g. manual docker exec).
+DEFAULT_MK_ROOT="/var/jenkins_home/minikube/ps2"
+MK_ROOT="${MK_ROOT:-${DEFAULT_MK_ROOT}}"
+MINIKUBE_HOME="${MINIKUBE_HOME:-${MK_ROOT}/.minikube}"
+KUBECONFIG="${KUBECONFIG:-${MK_ROOT}/.kube/config}"
+export MK_ROOT MINIKUBE_HOME KUBECONFIG
+
 NS="${1:-default}"
 SVC="${2:-django-service}"
 MODE="${3:-service-url-only}"
