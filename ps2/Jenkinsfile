@@ -435,12 +435,41 @@ if [ "${DO_SERVICE}" -eq 1 ]; then
   if [ -z "${SERVICE_PORT}" ]; then
     echo "WARN: Could not determine service port for ${NS}/${SVC}. Skipping Method A."
   else
-    PF_LOG="/tmp/${SVC}.port-forward.log"; : > "${PF_LOG}"
+    PF_LOG="/tmp/${NS}-${SVC}.port-forward.log"; : > "${PF_LOG}"
     pkill -f "port-forward.*svc/${SVC}" >/dev/null 2>&1 || true
 
-    echo "Starting kubectl port-forward to svc/${SVC}:${SERVICE_PORT} (bind 0.0.0.0)..."
-    # Bind to all interfaces so other containers on minikube-net can reach the tunnel.
-    nohup kube-ps2 -n "${NS}" port-forward --address 0.0.0.0 "svc/${SVC}" ":${SERVICE_PORT}" > "${PF_LOG}" 2>&1 &
+    echo "Starting kubectl port-forward to svc/${SVC}:${SERVICE_PORT} (detached via docker exec)..."
+    # Run port-forward inside the Jenkins container via docker exec so it survives shell cleanup.
+    PORT_FORWARD_STARTED=0
+    PF_WRAPPER="/tmp/expose-${NS}-${SVC}.port-forward.sh"
+    cat > "${PF_WRAPPER}" <<EOF
+#!/usr/bin/env sh
+set -eu
+export MK_ROOT="${MK_ROOT}"
+export MINIKUBE_HOME="${MINIKUBE_HOME}"
+export KUBECONFIG="${KUBECONFIG}"
+unset HTTP_PROXY HTTPS_PROXY http_proxy https_proxy
+export NO_PROXY='127.0.0.1,localhost,.local,.svc,cluster.local,10.96.0.0/12,10.244.0.0/16,10.123.0.0/16'
+export no_proxy='127.0.0.1,localhost,.local,.svc,cluster.local,10.96.0.0/12,10.244.0.0/16,10.123.0.0/16'
+exec kube-ps2 -n "${NS}" port-forward --address 0.0.0.0 "svc/${SVC}" ":${SERVICE_PORT}" >> "${PF_LOG}" 2>&1
+EOF
+    chmod +x "${PF_WRAPPER}"
+
+    if docker inspect "${JENKINS_ID}" >/dev/null 2>&1; then
+      if docker exec -d "${JENKINS_ID}" "${PF_WRAPPER}"; then
+        PORT_FORWARD_STARTED=1
+      else
+        echo "WARN: docker exec -d ${JENKINS_ID} failed; falling back to local background port-forward." >&2
+      fi
+    else
+      echo "WARN: Jenkins container (${JENKINS_ID}) not reachable via docker inspect; falling back to local background port-forward." >&2
+    fi
+
+    if [ "${PORT_FORWARD_STARTED}" -eq 0 ]; then
+      # Bind to all interfaces so other containers on minikube-net can reach the tunnel.
+      nohup kube-ps2 -n "${NS}" port-forward --address 0.0.0.0 "svc/${SVC}" ":${SERVICE_PORT}" > "${PF_LOG}" 2>&1 &
+      PORT_FORWARD_STARTED=1
+    fi
 
     LOCAL_PORT=""
     printf "Waiting for port-forward readiness "
